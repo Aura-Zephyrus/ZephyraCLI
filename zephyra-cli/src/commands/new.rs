@@ -126,7 +126,7 @@ d3d11 = ["dep:zephyra-winit"]
 zephyra-core = {{ path = "{core}" }}
 zephyra-fx = {{ path = "{fx}" }}
 zephyra-style = {{ path = "{style}" }}
-zstylec = {{ path = "{zstylec}" }}
+zstyle-compile = {{ path = "{zstyle_compile}" }}
 winit = "0.30"
 zephyra-winit-d3d12 = {{ path = "{d3d12}", optional = true }}
 zephyra-winit = {{ path = "{winit_base}", optional = true }}
@@ -134,7 +134,7 @@ zephyra-winit = {{ path = "{winit_base}", optional = true }}
         core = crate_dep("zephyra/zephyra-core"),
         fx = crate_dep("zephyra/zephyra-fx"),
         style = crate_dep("zephyra/zephyra-style"),
-        zstylec = crate_dep("zstylec"),
+        zstyle_compile = crate_dep("zstyle-compile"),
         d3d12 = crate_dep("zephyra/zephyra-base/zephyra-winit-d3d12"),
         winit_base = crate_dep("zephyra/zephyra-base/zephyra-winit"),
     )

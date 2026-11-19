@@ -1,14 +1,14 @@
 [package]
-name = "zypuic-bin"
+name = "zypuic"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.87"
-description = "zypuic CLI binary; compiler library stays in the ZephyraUI workspace"
+description = "zypuic CLI; compiler library lives in the ZephyraUI workspace"
 
 [[bin]]
 name = "zypuic"
 path = "src/main.rs"
 
 [dependencies]
-zypuic = { path = "../../ZephyraUI/zypuic" }
+zypui-compile = { path = "../../ZephyraUI/zypui-compile" }

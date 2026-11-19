@@ -4,6 +4,6 @@ resolver = "2"
 # gallery 的 build.rs 直接引用它们，所以主仓不依赖本仓 —— 依赖严格单向（本仓 → 主仓）。
 members = [
     "zephyra-cli",
-    "zstylec-bin",
-    "zypuic-bin",
+    "zstylec",
+    "zypuic",
 ]
