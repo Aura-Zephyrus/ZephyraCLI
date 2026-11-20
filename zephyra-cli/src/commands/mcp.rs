@@ -4,8 +4,13 @@
 //! # 链路与职责
 //!
 //! ```text
-//! AI 客户端 ──stdio·JSON-RPC── 本进程 ──TCP·行协议── 运行中的应用（zephyra-fx::bridge）
+//! AI 客户端 ──stdio·JSON-RPC── 本进程 ←──TCP·行协议── 运行中的应用
 //! ```
+//!
+//! **方向很重要**：应用主动连入 MCP，MCP 不再拿端口去连应用。`zephyra dev` /
+//! `run` 启动应用时把 MCP 的监听端口经 `ZEPHYRA_MCP_PORT` 交给子进程，应用
+//! 据此连回来。于是 agent 侧只有一个通道（stdio），MCP 与 agent 绑定、与
+//! 应用分离 —— 不再要求 agent 知道应用的调试端口。
 //!
 //! 本进程只做**翻译**：MCP 工具调用 ↔ 桥的行协议命令。它不理解布局树的内容
 //! （树 dump 是桥那边生成的文本，原样转发），也不持有任何 UI 状态 —— 应用一关，
@@ -41,6 +46,9 @@ use crate::bridge_client::{BridgeClient, BridgeResponse};
 use crate::{args::Args, ExitCode};
 
 use std::io::BufRead;
+use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 /// 一个 MCP 工具的定义（`tools/list` 的数据源 + `tools/call` 的执行）。
 struct Tool {
@@ -54,12 +62,52 @@ struct Tool {
     annotations: &'static str,
 }
 
+/// 本 server 支持的协议版本（新→旧）。
+///
+/// 消息形状（tools / ping / 取消 / 通知）在这些 revision 之间没有差别，所以全部
+/// 声明支持：客户端要哪个就回哪个；不认识的版本回我们最新的 —— 按 MCP 规范，
+/// 这就是让客户端自行决定继续还是断开的降级信号。
+const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// `initialize` 的 `instructions`：OpenCode / Claude 等客户端会把它注入系统
+/// 提示。有了它，模型不必从十几个工具名里猜「先读再操作再读」的工作流。
+const SERVER_INSTRUCTIONS: &str = "ZephyraUI UI driver. Read first, then act, then read again: \
+use get_layout for textual layout/context and get_tree for ABSOLUTE pixel coordinates; \
+use get_props for one node's full properties; use screenshot only when visual pixels matter. \
+Input tools (click/hover/press_key/scroll/pointer_drag) take effect on the current frame, so \
+follow them with get_layout or wait_frames before concluding. Tools need the app launched by \
+`zephyra dev`/`run` so it connects into this MCP server; initialize and tools/list work before that.";
+
+/// 按客户端请求选协议版本；见 [`PROTOCOL_VERSIONS`]。
+fn negotiated_version(requested: Option<&str>) -> &'static str {
+    match requested {
+        Some(v) => PROTOCOL_VERSIONS
+            .iter()
+            .copied()
+            .find(|s| *s == v)
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "[zephyra-mcp] client requested protocolVersion={v}; serving latest supported {}",
+                    PROTOCOL_VERSIONS[0]
+                );
+                PROTOCOL_VERSIONS[0]
+            }),
+        None => PROTOCOL_VERSIONS[0],
+    }
+}
+
 /// 读工具：不改变应用状态。
 const READ_ONLY: &str = r#"{"readOnlyHint": true, "destructiveHint": false}"#;
 /// 输入/采集类工具：会改变界面状态或进程内采样状态，但不销毁数据。
 const MUTATES: &str = r#"{"readOnlyHint": false, "destructiveHint": false}"#;
 
 const TOOLS: &[Tool] = &[
+    Tool {
+        name: "get_app_info",
+        description: "Identity the connected app reported when it linked to this MCP server         (`hello <app-name> <version>`). Use it to tell which app and framework version you are         driving. Needs no bridge round-trip and works before any other tool call.",
+        schema: r#"{"type": "object", "properties": {}}"#,
+        annotations: READ_ONLY,
+    },
     Tool {
         name: "get_layout",
         description: "Return the current UI layout as plain text for model context: \
@@ -265,12 +313,37 @@ pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
         .map(|p| p.parse())
         .transpose()
         .map_err(|_| CliError::usage("--port needs a number"))?
-        .unwrap_or(zephyra_bridge_port());
+        .unwrap_or_else(default_mcp_port);
     let host = args.option("host").unwrap_or("127.0.0.1").to_string();
+
+    // MCP 监听：由 `zephyra dev` / `run` 启动的应用会按 ZEPHYRA_MCP_PORT 连回来。
+    // agent 侧仍然只有 stdio 一个通道 —— MCP 与 agent 绑定、与应用分离。
+    let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| {
+        CliError::failure(format!(
+            "cannot listen for app connections on {host}:{port}: {e} \
+             （用 `zephyra mcp --port <n>` 换端口，并让 dev/run 的 ZEPHYRA_MCP_PORT 跟上）"
+        ))
+    })?;
+    let (app_tx, app_rx) = mpsc::channel::<TcpStream>();
+    std::thread::Builder::new()
+        .name("zephyra-mcp-app-accept".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => {
+                        if app_tx.send(s).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => eprintln!("[zephyra-mcp] app accept failed: {e}"),
+                }
+            }
+        })
+        .map_err(|e| CliError::failure(format!("cannot start app acceptor: {e}")))?;
 
     // 取消登记表：stdin 线程写，工具工作线程读（见模块文档的并发模型）。
     let cancelled = Cancelled::default();
-    let (job_tx, job_rx) = std::sync::mpsc::channel::<String>();
+    let (job_tx, job_rx) = mpsc::channel::<String>();
     let worker_cancelled = cancelled.clone();
     let worker_host = host.clone();
     std::thread::Builder::new()
@@ -278,10 +351,22 @@ pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
         .spawn(move || {
             // 工具线程持有唯一的桥会话——工具调用因此天然串行，AI 的
             // 「读-改-读」次序不会被并发打乱。
-            let mut session = Session::new(&worker_host, port, worker_cancelled);
-            for line in job_rx {
-                if let Some(reply) = handle_message(&line, &mut session) {
-                    write_reply(&reply);
+            let mut session = Session::inbound(&worker_host, port, worker_cancelled);
+            loop {
+                // 先收应用连入（非阻塞）；应用重启后会自动重连进来。
+                if let Ok(stream) = app_rx.try_recv() {
+                    eprintln!("[zephyra-mcp] app connected");
+                    session.attach(stream);
+                }
+                // 再等工具调用；20ms 超时保证 app_rx 不会被饿死。
+                match job_rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(line) => {
+                        if let Some(reply) = handle_message(&line, &mut session) {
+                            write_reply(&reply);
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
             // 通道关闭即退出。**不**等在途调用：客户端关 stdin 意味着它已经
@@ -291,11 +376,10 @@ pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
 
     // 主线程只处理不碰桥的消息（initialize / tools/list / ping / 通知）。
     // 握手不需要应用在线——AI 客户端往往先拉起 MCP 再起应用。
-    let mut session = Session::new(&host, port, cancelled);
+    let mut session = Session::inbound(&host, port, cancelled);
 
     io.err_line(&format!(
-        "[zephyra-mcp] ready (bridge {}:{port}); stdout is protocol-only",
-        host
+        "[zephyra-mcp] ready (listening for app on {host}:{port}); stdout is protocol-only"
     ));
 
     let stdin = std::io::stdin();
@@ -342,29 +426,71 @@ fn write_reply(reply: &str) {
 ///
 /// 主线程与工具线程各有一个实例（主线程的 `client` 永远是 `None`——它不碰桥），
 /// 但共享同一张取消表。
+///
+/// 生产路径用 [`Self::inbound`]：应用主动连入，`client` 由 [`Self::attach`] 安放。
+/// [`Self::new`] 保留旧的「主动拨号」形态，只给测试里的替身服务器用 —— 协议
+/// 测试不该因为拓扑反转而重写一遍。
 struct Session {
     host: String,
     port: u16,
     client: Option<BridgeClient>,
     cancelled: Cancelled,
+    /// true = 应用连入（生产）；false = 主动拨号（测试替身）。
+    inbound: bool,
+    /// 应用连入时报的身份（`hello <app-name> <version>`）。旧应用不发 ⇒ `None`。
+    app_identity: Option<String>,
 }
 
 impl Session {
+    /// 旧拓扑：客户端主动连应用到端口。**仅供测试**。
+    #[cfg(test)]
     fn new(host: &str, port: u16, cancelled: Cancelled) -> Self {
         Self {
             host: host.to_string(),
             port,
             client: None,
             cancelled,
+            inbound: false,
+            app_identity: None,
         }
     }
 
-    /// 拿到一条可用的桥连接：没有就连（重试 3 次）。
+    /// 生产拓扑：MCP 监听、应用连入。
+    fn inbound(host: &str, port: u16, cancelled: Cancelled) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            client: None,
+            cancelled,
+            inbound: true,
+            app_identity: None,
+        }
+    }
+
+    /// 应用连入时安放它的 socket。工具线程是唯一调用者。
     ///
-    /// 唯一的连接管理者——连接的生灭全部收敛在这里，不会出现
-    /// 「两条路径各养一个连接」。
+    /// 先读掉身份行（第一帧），再让出 client —— 否则下一句命令的响应会读到它。
+    /// 当前只挂一条应用流：后连的覆盖先连的，所以覆盖时明确记一条诊断。
+    fn attach(&mut self, stream: TcpStream) {
+        let mut client = BridgeClient::from_stream(stream);
+        let identity = client.read_hello();
+        match &identity {
+            Some(id) => eprintln!("[zephyra-mcp] app hello: {id}"),
+            None => eprintln!("[zephyra-mcp] app connected (no hello; legacy app?)"),
+        }
+        if let Some(previous) = self.app_identity.take() {
+            eprintln!("[zephyra-mcp] app stream replaced (previous hello: {previous})");
+        }
+        self.app_identity = identity;
+        self.client = Some(client);
+    }
+
+    /// 拿到当前应用连接。
+    ///
+    /// 生产拓扑下没有应用连入就**明确报错**，绝不回退到「拿端口去连应用」——
+    /// 那正是本次改造要去掉的路径（agent 不该知道应用的调试端口）。
     fn ensure_client(&mut self) -> Result<&mut BridgeClient, String> {
-        if self.client.is_none() {
+        if self.client.is_none() && !self.inbound {
             let (host, port) = (self.host.clone(), self.port);
             self.client = Some(BridgeClient::connect(&host, port, 3).map_err(|e| {
                 format!(
@@ -372,11 +498,17 @@ impl Session {
                 )
             })?);
         }
-        Ok(self.client.as_mut().unwrap())
+        self.client.as_mut().ok_or_else(|| {
+            format!(
+                "应用尚未连入 MCP（监听 {}:{}）——用 `zephyra dev` / `zephyra run` 启动应用，\
+                 CLI 会把 ZEPHYRA_MCP_PORT={} 交给它",
+                self.host, self.port, self.port
+            )
+        })
     }
 
     /// 丢弃当前连接。**半读之后的流不可复用**：缓冲里可能压着半条响应，
-    /// 继续用会让后续响应切分错位；唯一正确的动作是断掉重连。
+    /// 继续用会让后续响应切分错位；唯一正确的动作是等应用重连。
     fn drop_client(&mut self) {
         self.client = None;
     }
@@ -399,10 +531,19 @@ impl Cancelled {
     }
 }
 
-/// 应用侧桥的默认端口。CLI 不依赖 zephyra-fx，常量这里**独立**写——
-/// 但它必须与 `zephyra_fx::bridge::DEFAULT_PORT` 一致（测试钉住这一点）。
+/// 应用侧桥的默认端口。运行时刻意不依赖 `zephyra-fx`，常量独立写；
+/// 一致性由下面 `default_port_matches_bridge` 的 dev-dependency 测试钉住。
 fn zephyra_bridge_port() -> u16 {
     7878
+}
+
+/// MCP 的默认监听端口。优先读 `ZEPHYRA_MCP_PORT` —— CLI 启动应用时把同一个
+/// 值交给它，所以这一处环境变量就让「MCP 监听端口」与「应用连入端口」对齐。
+fn default_mcp_port() -> u16 {
+    std::env::var(super::MCP_PORT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(zephyra_bridge_port)
 }
 
 /// 处理一条 JSON-RPC 消息。返回要写回 stdout 的 JSON 行；通知类与已取消的
@@ -441,22 +582,19 @@ fn handle_message(line: &str, session: &mut Session) -> Option<String> {
         // 与「应用在不在线」无关。
         "ping" => Some(json_reply(id, json!({}))),
         "initialize" => {
-            // 版本协商：本 server 只实现了 2024-11-05 的消息形状（tools +
-            // stdio）。客户端要更新版本时回我们的版本——按协议这就是降级
-            // 信号，客户端会据此决定继续还是断开。客户端要的版本打到 stderr
-            // 供排查。
-            if let Some(v) = msg
-                .pointer("/params/protocolVersion")
-                .and_then(Value::as_str)
-            {
-                eprintln!("[zephyra-mcp] client requested protocolVersion={v}; serving 2024-11-05");
-            }
+            // 版本协商见 `negotiated_version`。`instructions` 会被 OpenCode /
+            // Claude 等客户端注入系统提示，是「模型会用这些工具」的关键一环。
+            let version = negotiated_version(
+                msg.pointer("/params/protocolVersion")
+                    .and_then(Value::as_str),
+            );
             Some(json_reply(
                 id,
                 json!({
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "zephyra", "version": crate::VERSION}
+                    "serverInfo": {"name": "zephyra", "version": crate::VERSION},
+                    "instructions": SERVER_INSTRUCTIONS
                 }),
             ))
         }
@@ -591,6 +729,11 @@ fn run_tool(
     cancel_key: &str,
 ) -> Result<ToolOutcome, String> {
     match name {
+        // 身份是会话级信息，不碰桥 —— 没有应用连入也能答（告诉 AI 还没连上）。
+        "get_app_info" => reply(match &session.app_identity {
+            Some(id) => format!("app identity: {id}"),
+            None => "no app connected yet (or app did not send hello)".into(),
+        }),
         "get_tree" => reply(text_of(with_bridge(session, |c| c.call("tree"))?)?),
         "get_layout" => reply(text_of(with_bridge(session, |c| c.call("layout"))?)?),
         "get_stats" => reply(text_of(with_bridge(session, |c| c.call("stats"))?)?),
@@ -1390,6 +1533,56 @@ mod tests {
         assert!(session.client.is_none());
     }
 
+    /// 版本协商按 MCP 规范：客户端要的版本我们支持就原样回；不认识就回我们
+    /// 最新的（降级信号）。`instructions` 会被 OpenCode / Claude 注入系统提示。
+    #[test]
+    fn initialize_negotiates_version_and_returns_instructions() {
+        let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+            &mut session,
+        )
+        .unwrap();
+        assert!(r.contains("\"protocolVersion\":\"2025-06-18\""), "{r}");
+        assert!(r.contains("\"instructions\""), "{r}");
+        assert!(r.contains("get_layout"), "{r}");
+
+        let r2 = handle_message(
+            r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#,
+            &mut session,
+        )
+        .unwrap();
+        assert!(
+            r2.contains(&format!("\"protocolVersion\":\"{}\"", PROTOCOL_VERSIONS[0])),
+            "{r2}"
+        );
+    }
+
+    /// 生产拓扑：没有应用连入就明确报错；连入后工具走那条已建立的流。
+    #[test]
+    fn inbound_session_uses_app_stream_and_reports_when_absent() {
+        let mut absent = Session::inbound("127.0.0.1", 1, Cancelled::default());
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"ping","arguments":{}}}"#,
+            &mut absent,
+        )
+        .unwrap();
+        assert!(r.contains("应用尚未连入 MCP"), "{r}");
+        assert!(r.contains("isError"), "{r}");
+
+        let (port, seen) = mock_bridge("pong");
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut session = Session::inbound("127.0.0.1", port, Cancelled::default());
+        session.attach(stream);
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"ping","arguments":{}}}"#,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(seen.recv().unwrap(), "ping");
+        assert!(r.contains("pong"), "{r}");
+    }
+
     /// JSON-RPC 层的 `ping`（MCP keepalive）必须立即回空 result 且不碰桥：
     /// 它探测的是「MCP server 活没活着」，与应用在不在线无关。
     #[test]
@@ -1437,6 +1630,7 @@ mod tests {
         )
         .unwrap();
         for t in [
+            "get_app_info",
             "get_tree",
             "get_layout",
             "get_props",
@@ -1899,10 +2093,52 @@ mod tests {
 
     /// 协议常量对齐：CLI 的默认端口必须与库层桥一致。
     ///
-    /// 为什么不直接 `use zephyra_fx::bridge::DEFAULT_PORT`：CLI 刻意不依赖
-    /// `zephyra-fx`——一致性靠这条测试钉住，而不是靠一条依赖边。
+    /// 用 dev-dependency 直接引用框架常量，而不是硬编码 7878 —— 这样任一侧
+    /// 改动都会让这条测试变红，是真正的跨仓门禁。运行时仍不依赖 zephyra-fx。
     #[test]
     fn default_port_matches_bridge() {
-        assert_eq!(zephyra_bridge_port(), 7878);
+        assert_eq!(zephyra_bridge_port(), zephyra_fx::bridge::DEFAULT_PORT);
     }
+
+    /// 连入 MCP 的环境变量名必须与框架侧一致。
+    ///
+    /// CLI 注入 `MCP_PORT_ENV`，应用侧 `zephyra-fx` 读同一个名字；两侧各写
+    /// 一份字面量，靠这条测试钉住（dev-dependency 不进入运行时依赖）。
+    #[test]
+    fn mcp_port_env_matches_bridge() {
+        assert_eq!(
+            crate::commands::MCP_PORT_ENV,
+            zephyra_fx::bridge::MCP_PORT_ENV
+        );
+    }
+}
+
+/// 身份行的读者必须与桥的写法对齐：`hello <name> <version>` 一行，不含其它。
+#[test]
+fn read_hello_consumes_only_the_identity_line() {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"hello gallery 0.1.0\n").unwrap();
+        stream
+    });
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    let mut client = crate::bridge_client::BridgeClient::from_stream(stream);
+    let hello = client.read_hello();
+    server.join().unwrap();
+    assert_eq!(hello.as_deref(), Some("gallery 0.1.0"));
+}
+
+#[test]
+fn get_app_info_without_app_says_so() {
+    let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+    let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_app_info","arguments":{}}}"#,
+            &mut session,
+        )
+        .unwrap();
+    assert!(r.contains("no app"), "{r}");
+    assert!(session.client.is_none(), "get_app_info 不该碰桥");
 }

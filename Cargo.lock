@@ -356,6 +356,7 @@ version = "0.1.0"
 dependencies = [
  "png",
  "serde_json",
+ "zephyra-fx",
  "zstylec",
  "zypuic",
 ]
@@ -364,6 +365,14 @@ dependencies = [
 name = "zephyra-core"
 version = "0.1.0"
 dependencies = [
+ "zephyra-vector",
+]
+
+[[package]]
+name = "zephyra-fx"
+version = "0.1.0"
+dependencies = [
+ "zephyra-core",
  "zephyra-vector",
 ]
 

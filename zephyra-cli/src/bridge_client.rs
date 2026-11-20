@@ -37,13 +37,14 @@ pub(crate) enum BridgeResponse {
 impl BridgeClient {
     /// 用一条**已建立**的连接构造。
     ///
-    /// 存在的理由：测试要拿**替身服务器**给的流（而不是真的去连一个端口），
-    /// 而字段是私有的。没有这个入口，测试就只能靠「真的起一个监听端口」——
-    /// 那是把协议测试写成网络测试，端口与时序都会变成 flake 的来源。
-    ///
-    /// ⚠ 只在测试里用：生产路径一律走 [`Self::connect`]（它带重试与读超时）。
-    #[cfg(test)]
+    /// 测试拿替身服务器给的流；生产路径里 `mcp` 用它接住**应用主动连入**的
+    /// socket（新的拓扑：MCP 监听、应用连入，agent 只经 stdio 与 MCP 说话）。
     pub(crate) fn from_stream(stream: std::net::TcpStream) -> Self {
+        stream.set_nodelay(true).ok();
+        // 应用帧循环停摆时 read 不能永久阻塞，否则 MCP server 不再应答任何消息。
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
         Self {
             stream,
             buf: Vec::new(),
@@ -78,6 +79,41 @@ impl BridgeClient {
             }
         }
         Err(last.unwrap_or_else(|| std::io::Error::other("connect failed")))
+    }
+
+    /// 读应用连入后主动发来的身份行（`hello <app-name> <version>`）。
+    ///
+    /// 必须在新连接的第一次 [`Self::call`] **之前**调用：应用把身份作为第一帧
+    /// 发出，不先读掉，下一句命令的响应就会读到它，协议整体错位一格。
+    ///
+    /// 短超时（200 ms）且兼容旧应用：连上却没发 hello 时返回 `None`，不阻塞 MCP。
+    pub(crate) fn read_hello(&mut self) -> Option<String> {
+        self.stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .ok();
+        let result = self.read_hello_inner();
+        self.stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        result
+    }
+
+    fn read_hello_inner(&mut self) -> Option<String> {
+        let mut chunk = [0u8; 512];
+        // 通常一次 read 就拿到整行；半行时再读几次（仍在同一 200 ms 超时内）。
+        for _ in 0..4 {
+            if let Some(end) = self.buf.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&self.buf[..end]).into_owned();
+                self.buf.drain(..=end);
+                return line.strip_prefix("hello ").map(|s| s.to_string());
+            }
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return None,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return None,
+            }
+        }
+        None
     }
 
     /// 发一条命令并读一条响应。
