@@ -2101,7 +2101,7 @@ mod tests {
     /// 改动都会让这条测试变红，是真正的跨仓门禁。运行时仍不依赖 zephyra-fx。
     #[test]
     fn default_port_matches_bridge() {
-        assert_eq!(zephyra_bridge_port(), zephyra_fx::bridge::DEFAULT_PORT);
+        assert_eq!(zephyra_bridge_port(), zephyra_fx::DEFAULT_PORT);
     }
 
     /// 连入 MCP 的环境变量名必须与框架侧一致。
@@ -2110,10 +2110,7 @@ mod tests {
     /// 一份字面量，靠这条测试钉住（dev-dependency 不进入运行时依赖）。
     #[test]
     fn mcp_port_env_matches_bridge() {
-        assert_eq!(
-            crate::commands::MCP_PORT_ENV,
-            zephyra_fx::bridge::MCP_PORT_ENV
-        );
+        assert_eq!(crate::commands::MCP_PORT_ENV, zephyra_fx::MCP_PORT_ENV);
     }
 }
 
