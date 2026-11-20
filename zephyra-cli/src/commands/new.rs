@@ -121,6 +121,9 @@ publish = false
 default = ["d3d12"]
 d3d12 = ["dep:zephyra-winit-d3d12"]
 d3d11 = ["dep:zephyra-winit"]
+# zephyra build --sf 会传这个 feature：样式表内嵌进 exe；不传则运行时从
+# frontend/ 读文件，配合 zephyra pack 的普通模式。
+sf = []
 
 [dependencies]
 zephyra-core = {{ path = "{core}" }}
@@ -212,7 +215,7 @@ cargo run --no-default-features --features d3d11
 - `frontend/app.rs`：可交互示例 View，展示应用状态、稳定节点 key 和元素结构。
 - `frontend/app.zstyle`：外观和布局样式；源码描述元素与状态，不硬编码颜色或字号。
 - `zephyra.toml`：应用名、初始物理像素尺寸和样式表入口。
-- `ZephyraUI.json`：窗口选项。通过 `zephyra run`、`dev`、`build` 生成的程序会嵌入它；
+- `ZephyraUI.json`：窗口选项。通过 `dev`、`build` 生成的程序会嵌入它；
   `window.frameless: true` 会移除系统标题栏，自绘标题栏和拖动行为由应用实现；
   `window.transparent: true` 开启窗口透明模式（逐像素 alpha，含 frameless；
   见 docs/developer/win/07-window-transparent.md）。
@@ -245,6 +248,12 @@ fn main_rs(name: &str) -> String {
     r#"#[path = "../frontend/app.rs"]
 mod frontend;
 use frontend::App;
+use std::sync::Arc;
+#[cfg(debug_assertions)]
+use zephyra_core::node::Node;
+#[cfg(debug_assertions)]
+use zephyra_core::styler::Styler;
+use zephyra_style::SheetStyler;
 #[cfg(all(windows, feature = "d3d12"))]
 use zephyra_winit_d3d12::HostWindow;
 #[cfg(all(windows, feature = "d3d11", not(feature = "d3d12")))]
@@ -277,7 +286,66 @@ impl ApplicationHandler for Bootstrap {
             return;
         }
         let app = self.app.take().expect("resumed called without an application");
-        self.inner = Some(Host::new_lenient(event_loop, app));
+        let mut host = Host::new_lenient(event_loop, app);
+
+        // 样式来源按构建模式切换：--sf 内嵌；普通模式运行时从工程根读文件。
+        #[cfg(feature = "sf")]
+        let style_src: &str = include_str!("../frontend/app.zstyle");
+        #[cfg(not(feature = "sf"))]
+        let style_src: String = std::fs::read_to_string("frontend/app.zstyle").unwrap_or_else(|e| {
+            panic!("读取 frontend/app.zstyle 失败: {e}（普通模式请从工程根运行，或用 build --sf 内嵌）")
+        });
+        let parsed = zstyle_compile::parse("app", &style_src);
+        assert!(parsed.is_ok(), "app.zstyle 解析失败: {:?}", parsed.errors);
+        let sheet = Arc::new(parsed.sheet);
+
+        #[cfg(debug_assertions)]
+        {
+            let initial = sheet.clone();
+            let (styler, handle) = zephyra_fx::dev_reload::reloadable_styler(Arc::new(
+                move |root: &mut Node| SheetStyler::new(initial.clone()).apply(root),
+            ));
+            host.set_styler(Box::new(styler));
+
+            // dev 把资源目录经 ZEPHYRA_DEV_ASSETS 交给应用；release 没有这段代码。
+            let roots = zephyra_fx::dev_reload::assets_from_env();
+            host.set_dev_reloader(zephyra_fx::dev_reload::DevReloader::new(
+                &roots,
+                move |paths| {
+                    if !paths
+                        .iter()
+                        .any(|p| p.extension().and_then(|s| s.to_str()) == Some("zstyle"))
+                    {
+                        return;
+                    }
+                    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/frontend/app.zstyle");
+                    let Ok(src) = std::fs::read_to_string(file) else {
+                        eprintln!("[zephyra-dev] .zstyle read failed: {file}");
+                        return;
+                    };
+                    let parsed = zstyle_compile::parse("app", &src);
+                    if !parsed.is_ok() {
+                        eprintln!(
+                            "[zephyra-dev] .zstyle reload failed ({} error(s)):",
+                            parsed.errors.len()
+                        );
+                        for e in &parsed.errors {
+                            eprintln!("  {e}");
+                        }
+                        return;
+                    }
+                    let next = Arc::new(parsed.sheet);
+                    handle.set(Arc::new(move |root: &mut Node| {
+                        SheetStyler::new(next.clone()).apply(root)
+                    }));
+                    eprintln!("[zephyra-dev] .zstyle reloaded: {file}");
+                },
+            ));
+        }
+        #[cfg(not(debug_assertions))]
+        host.set_styler(Box::new(SheetStyler::new(sheet)));
+
+        self.inner = Some(host);
     }
 
     fn window_event(
@@ -297,6 +365,11 @@ impl ApplicationHandler for Bootstrap {
     all(windows, feature = "d3d11", not(feature = "d3d12"))
 ))]
 fn main() {
+    // 普通模式的动态库自检：缺库时给明确提示，退出码 3（环境缺失）。
+    if let Err(e) = zephyra_fx::link_check::ensure_dynamic_libs() {
+        eprintln!("{e}");
+        std::process::exit(3);
+    }
     let event_loop = EventLoop::new().expect("EventLoop::new");
     let mut boot = Bootstrap {
         inner: None,

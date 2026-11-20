@@ -47,23 +47,35 @@ ZEPHYRA_DEBUG_PORT=7878 cargo run --bin gallery
 - 后端切换走工程现有的 Cargo feature，不要同时启用互斥后端：`zephyra-gallery` 默认 `d3d12`，`--no-default-features --features d3d11` 切 D3D11，`--features linux-vk` 切 Vulkan。
 - `zephyra dev` / `zephyra run` 会 `Command::new(cargo)` 起子进程并**继承环境变量**，所以先 `export ZEPHYRA_DEBUG_PORT` 再 `zephyra dev` 同样开桥。
 
-### 2. 客户端侧：配置 MCP server
+### 2. 两侧拓扑：agent ↔ MCP（stdio）← 应用（连入）
 
-MCP host 以 stdio 启动 CLI：
+**方向**：MCP 与 agent 绑定、与应用分离。agent 只经 stdio 与 MCP 说话；
+MCP 监听本地端口，**应用启动后主动连进来**。`zephyra dev` / `run` 启动应用时
+把监听端口经 `ZEPHYRA_MCP_PORT` 交给子进程，应用据此连回 MCP —— agent 侧
+不需要知道应用的调试端口。
 
-```json
-{
-  "mcpServers": {
-    "zephyra": { "command": "zephyra", "args": ["mcp"] }
-  }
-}
-```
+客户端配置：
 
-- CLI 二进制名是 `zephyra`（另有 `cargo-zephyra`）。不在 `PATH` 时把 `command` 换成可执行文件完整路径，例如仓库内的 `target/release/zephyra.exe`。
-- `zephyra mcp [--port 7878] [--host 127.0.0.1]`。`--port` **默认恒为 7878**，不读 `ZEPHYRA_DEBUG_PORT`—— 应用改了端口，CLI 侧必须显式 `--port` 跟上。`--host` 默认 `127.0.0.1`。
-- CLI 的 stdout **只**输出 JSON-RPC 协议消息，诊断一律走 stderr；`mcp` 启动后 stderr 首行是 `[zephyra-mcp] ready (bridge 127.0.0.1:7878); stdout is protocol-only`。
-- 握手（`initialize` / `tools/list`）**不需要**应用在线，连接在第一次 `tools/call` 时才建立（重试 3 次 × 500 ms）。应用后启动是常态。
-- 协议版本 `2024-11-05`。
+- **OpenCode v2**（`opencode.jsonc`，v2 用 `mcp.servers`）：
+  ```jsonc
+  { "mcp": { "servers": {
+    "zephyra": { "type": "local", "command": ["zephyra", "mcp"] }
+  } } }
+  ```
+- **Codex**（`~/.codex/config.toml`）：
+  ```toml
+  [mcp_servers.zephyra]
+  command = "zephyra"
+  args = ["mcp"]
+  ```
+- **Claude Desktop**：`{"mcpServers":{"zephyra":{"command":"zephyra","args":["mcp"]}}}`
+- **Claude Code**：`claude mcp add zephyra -- zephyra mcp`
+
+- CLI 二进制名是 `zephyra`（另有 `cargo-zephyra`）。不在 `PATH` 时把 command 换成完整路径，例如仓库内的 `target/release/zephyra.exe`。
+- `zephyra mcp [--port 7878] [--host 127.0.0.1]`。`--port` 是 **MCP 自己的监听端口**，默认 7878，也读环境变量 `ZEPHYRA_MCP_PORT`；dev 把同一个变量的值交给应用，所以一处设置两端对齐。`--host` 默认 `127.0.0.1`。
+- CLI 的 stdout **只**输出 JSON-RPC 协议消息，诊断一律走 stderr；`mcp` 启动后 stderr 首行是 `[zephyra-mcp] ready (listening for app on 127.0.0.1:7878); stdout is protocol-only`。应用连入时打 `[zephyra-mcp] app connected`。
+- 握手（`initialize` / `tools/list`）**不需要**应用在线；但工具调用需要应用已连入，否则回明确错误「应用尚未连入 MCP……用 zephyra dev 启动应用」。
+- 协议版本协商 `2025-11-25` / `2025-06-18` / `2025-03-26` / `2024-11-05`（客户端要哪个回哪个，不认识回最新的）。`initialize` 的 `instructions` 告诉模型读-改-读工作流。
 
 ## 标准工作流
 

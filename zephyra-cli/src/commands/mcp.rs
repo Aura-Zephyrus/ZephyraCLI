@@ -76,7 +76,7 @@ use get_layout for textual layout/context and get_tree for ABSOLUTE pixel coordi
 use get_props for one node's full properties; use screenshot only when visual pixels matter. \
 Input tools (click/hover/press_key/scroll/pointer_drag) take effect on the current frame, so \
 follow them with get_layout or wait_frames before concluding. Tools need the app launched by \
-`zephyra dev`/`run` so it connects into this MCP server; initialize and tools/list work before that.";
+`zephyra dev` so it connects into this MCP server; initialize and tools/list work before that.";
 
 /// 按客户端请求选协议版本；见 [`PROTOCOL_VERSIONS`]。
 fn negotiated_version(requested: Option<&str>) -> &'static str {
@@ -323,7 +323,7 @@ pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| {
         CliError::failure(format!(
             "cannot listen for app connections on {host}:{port}: {e} \
-             （用 `zephyra mcp --port <n>` 换端口，并让 dev/run 的 ZEPHYRA_MCP_PORT 跟上）"
+             （用 `zephyra mcp --port <n>` 换端口，并让 dev 的 ZEPHYRA_MCP_PORT 跟上）"
         ))
     })?;
     let (app_tx, app_rx) = mpsc::channel::<(BridgeClient, Option<String>)>();
@@ -504,7 +504,7 @@ impl Session {
         }
         self.client.as_mut().ok_or_else(|| {
             format!(
-                "应用尚未连入 MCP（监听 {}:{}）——用 `zephyra dev` / `zephyra run` 启动应用，\
+                "应用尚未连入 MCP（监听 {}:{}）——用 `zephyra dev` 启动应用，\
                  CLI 会把 ZEPHYRA_MCP_PORT={} 交给它",
                 self.host, self.port, self.port
             )

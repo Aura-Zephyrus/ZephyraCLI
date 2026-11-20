@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# 本仓的 zstylec / zypuic 通过 ../../ZephyraUI 引用主仓的编译库，
+# 所以两个仓要并排 checkout（ZephyraCLI/ 与 ZephyraUI/）。
+jobs:
+  check:
+    name: fmt / clippy / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - name: Checkout ZephyraCLI
+        uses: actions/checkout@v4
+        with:
+          path: ZephyraCLI
+
+      - name: Checkout ZephyraUI (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: Aura-Zephyrus/ZephyraUI
+          path: ZephyraUI
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ZephyraCLI
+
+      # CLI 的退出码与错误文案被测试钉死，这三个门禁一个都不能少。
+      - name: rustfmt
+        working-directory: ZephyraCLI
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        working-directory: ZephyraCLI
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        working-directory: ZephyraCLI
+        run: cargo test --workspace --all-targets

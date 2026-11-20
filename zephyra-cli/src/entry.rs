@@ -36,9 +36,31 @@ pub fn main_entry() -> ProcessExit {
     ProcessExit::from(dispatch(&bin, argv, &mut io).code())
 }
 
+/// 把名字列表渲染成 `--a --b`；空表给 `(none)`，免得报错里是一行空白。
+fn render_names(names: Vec<&'static str>) -> String {
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names
+            .iter()
+            .map(|s| format!("--{s}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 fn dispatch(bin: &str, argv: Vec<String>, io: &mut dyn Write) -> ExitCode {
     let parsed = match args::parse(argv) {
-        ParseOutcome::Help => {
+        ParseOutcome::Help(Some(name)) => {
+            if let Some(cmd) = commands::find(&name) {
+                io.line(&commands::render_command_help(bin, crate::VERSION, cmd));
+                return ExitCode::Success;
+            }
+            io.err_line(&format!("error: unknown command `{name}`"));
+            io.err_line(&commands::render_help(bin, crate::VERSION));
+            return ExitCode::Usage;
+        }
+        ParseOutcome::Help(None) => {
             io.line(&commands::render_help(bin, crate::VERSION));
             return ExitCode::Success;
         }
@@ -71,57 +93,41 @@ fn dispatch(bin: &str, argv: Vec<String>, io: &mut dyn Write) -> ExitCode {
         return ExitCode::Usage;
     };
 
-    // ⚠ 未知标志**立刻**报用法错，不静默忽略 —— 见 `Command::flags` 的说明。
+    // ⚠ 未知标志**立刻**报用法错，不静默忽略 —— 见 `Command::options` 的说明。
     // `--` 之后的位置参数不算标志（它们原样透传给 cargo）。
     // `any` 而不是 `position(..).is_some()`：后者会在 clippy 1.93 上触发
     // `search_is_some`（`-D warnings` 直接红），而这里要的只是「有没有」。
+    //
+    // 门禁与解析器读的是**同一份**声明（`cmd.options`）：标志属不属于本命令、
+    // 选项是否取值，都在命令表里声明一次。这样就不会出现「解析器把 2000 吃成
+    // `--duration-ms` 的值、门禁却报 unknown option」这种自相矛盾的错。
     let after_ddash = parsed.positional.iter().any(|x| x == "--");
     if !after_ddash {
-        for f in &parsed.flags {
-            if !cmd.flags.contains(&f.as_str()) {
+        for f in parsed.flags() {
+            if !cmd.accepts_flag(f) {
                 io.err_line(&format!(
                     "error: unknown flag `--{f}` for `{bin} {}`",
                     cmd.name
                 ));
                 io.err_line(&format!(
                     "       accepted: {}",
-                    if cmd.flags.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        cmd.flags
-                            .iter()
-                            .map(|s| format!("--{s}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    }
+                    render_names(cmd.accepted_flags())
                 ));
                 io.err_line(&format!("try `{bin} --help`"));
                 return ExitCode::Usage;
             }
         }
-        for (k, _) in &parsed.options {
-            // ⚠ 判据取自 `args::VALUE_FLAGS` —— **不要**在这里另抄一份名单。
-            //
-            // 另抄的后果是「解析器认得、门禁不认」：用户敲 `zephyra perf watch
-            // --duration-ms 2000`，解析器把 `2000` 吃成取值，门禁却报
-            // 「unknown option」—— 而**值已经被吃掉了**，于是用户改成
-            // `--duration-ms=2000` 也不行（同一个门禁）。
-            //
-            // 门禁与解析器必须**同一份名单**，否则「文档里有的选项」有一半
-            // 用不了，而报错信息还指向不了真正的原因。
-            if !crate::args::VALUE_FLAGS.contains(&k.as_str()) {
+        for (k, _) in parsed.options() {
+            if !cmd.accepts_value(k) {
                 io.err_line(&format!(
                     "error: unknown option `--{k}` for `{bin} {}`",
                     cmd.name
                 ));
                 io.err_line(&format!(
                     "       accepted: {}",
-                    crate::args::VALUE_FLAGS
-                        .iter()
-                        .map(|s| format!("--{s}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
+                    render_names(cmd.accepted_values())
                 ));
+                io.err_line(&format!("try `{bin} --help`"));
                 return ExitCode::Usage;
             }
         }

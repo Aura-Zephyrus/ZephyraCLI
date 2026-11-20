@@ -53,7 +53,7 @@ pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
     // `zephyra bridge log <file>`：**本地**读日志，不需要连应用。
     //
     // 放在 `bridge` 下面是因为它服务的是同一个排查场景（应用跑着，你看它的
-    // 输出）—— 而 `run --log` / `dev --log` 落下来的那份正是给这里看的。
+    // 输出）—— 而 `build --log` / `dev --log` 落下来的那份正是给这里看的。
     if args.positional.first().map(String::as_str) == Some("log") {
         return log_tail(args, io);
     }

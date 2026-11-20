@@ -13,6 +13,9 @@ target\release\zephyra.exe --help
 cargo zephyra dev
 ```
 
+帮助分两级：`zephyra --help`（或 `-h`）列全部命令与选项；`zephyra <command> --help`
+只列该命令的 USAGE、about、选项与退出码，例如 `zephyra dev --help`。
+
 `cargo-zephyra` 这个名字**不能改**：cargo 靠「`cargo-` + 子命令名」去 PATH 上找子
 命令可执行文件，并把子命令名一起传进来（`cargo zephyra dev` ⇒ argv[1] 是
 `zephyra`）。入口里会剥掉它，所以两个入口等价。
@@ -24,8 +27,8 @@ cargo zephyra dev
 | `new <name>` | 生成一个能运行的交互示例工程，附带关键开发说明（`--path <dir>`、`--force`） |
 | `check <file.zstyle>...` | 查样式表（`--format human\|json`） |
 | `fmt [<路径>...]` | 排版：`.zstyle` / `.zypui` / Rust（`cargo fmt`）三者一起；`--check` 只报不写 |
-| `dev` | 开发模式：打开 trace，样式表或窗口配置变更后重启 |
-| `run` / `build` | 转交 cargo，并将项目窗口配置嵌入应用 |
+| `dev` | 开发模式：打开 trace，Rust 源码变更后重启（热编译）；样式表 / UI 进程内热重载 |
+| `build` | 转交 `cargo build`（默认 release，`--debug` 切 debug），并将窗口配置嵌入应用 |
 | `info` | 版本与工具链状态（含路径） |
 | `props [过滤词]` | 列受支持的属性 |
 | `mcp` | MCP server：AI 直连运行中的界面（见下） |
@@ -50,17 +53,47 @@ zephyra new myapp --path E:\work
 zephyra mcp [--port 7878] [--host 127.0.0.1]
 ```
 
-把 ZephyraUI 应用交给 AI 操控的桥。链路三层：
+**MCP 与 agent 绑定、与应用分离**：agent 只经 stdio 与 MCP 说话；MCP 监听一个
+本地端口，**应用启动后主动连进来** —— 不再让 agent 拿端口去连应用。
 
 ```text
-AI 客户端 ──stdio·JSON-RPC── zephyra mcp ──TCP·行协议── 运行中的应用
+AI 客户端 ──stdio·JSON-RPC── zephyra mcp ←──TCP·行协议── 运行中的应用
+                                  ↑
+                  CLI 启动应用时注入 ZEPHYRA_MCP_PORT=<port>
 ```
 
 **用法**：
 
-1. 应用以 `ZEPHYRA_DEBUG_PORT=7878`（默认端口）启动——库层调试桥随环境变量
-   开启，不设则**零监听**（默认关闭，不存在隐式端口）；
-2. AI 客户端（Claude / WorkBuddy / 任何 MCP host）配一条 stdio MCP server：
+1. 在 agent 侧配一条 stdio MCP server（见下）；
+2. 用 `zephyra dev` / `zephyra run` 启动应用 —— CLI 把 MCP 端口经
+   `ZEPHYRA_MCP_PORT` 交给子进程，应用启动后据此连入 MCP。握手
+   （`initialize` / `tools/list`）不需要应用在线。
+
+**各客户端配置**（二进制不在 `PATH` 时，把命令换成完整路径如
+`target\release\zephyra.exe`）：
+
+- **OpenCode v2** —— `opencode.jsonc`（项目内或全局），注意 v2 是 `mcp.servers`：
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "zephyra": { "type": "local", "command": ["zephyra", "mcp"] }
+    }
+  }
+}
+```
+
+- **Codex** —— `~/.codex/config.toml`：
+
+```toml
+[mcp_servers.zephyra]
+command = "zephyra"
+args = ["mcp"]
+```
+
+- **Claude Desktop** —— `claude_desktop_config.json`：
 
 ```json
 {
@@ -69,6 +102,14 @@ AI 客户端 ──stdio·JSON-RPC── zephyra mcp ──TCP·行协议── 
   }
 }
 ```
+
+- **Claude Code** —— `claude mcp add zephyra -- zephyra mcp`
+
+`--port` 是 MCP 的**监听端口**（默认 7878，也读环境变量 `ZEPHYRA_MCP_PORT`）。
+CLI 把同一个环境变量的值交给应用，所以一处设置两端自动对齐；若改了端口，
+确保启动应用的 dev 进程也能看到同一个 `ZEPHYRA_MCP_PORT`。
+`initialize` 返回的 `instructions` 会被 OpenCode / Claude 注入系统提示，
+告诉模型「先读布局、再操作、再读回」的工作流。
 
 **工具表**：
 
@@ -100,18 +141,18 @@ AI 客户端 ──stdio·JSON-RPC── zephyra mcp ──TCP·行协议── 
 
 - `mcp` 进程的 stdout **只**输出 JSON-RPC 消息，诊断全走 stderr——MCP stdio
   传输的硬约束，违反即客户端解析失败；
-- MCP 握手（`initialize` / `tools/list`）**不需要**应用在线；连接在第一次
-  `tools/call` 时才建立（重试 3 次 × 500ms），应用后启动是常态；
-- **应用重启不废会话**：传输失败（应用重启留下死连接是 dev 工作流常态）会
-  丢连接、重连、重试一次，下一次 `tools/call` 自动恢复；
+- MCP 握手（`initialize` / `tools/list`）**不需要**应用在线；应用由 `dev` /
+  `run` 启动后主动连入，连上之前工具调用会回明确错误；
+- **应用重启不废会话**：应用重启留下死连接是 dev 工作流常态 —— 应用侧会
+  自动重连进 MCP，MCP 收到新连接就替换旧会话，下一次 `tools/call` 自动恢复；
 - 每次桥 I/O 有 **10 秒读超时**：冻结的应用最多拖慢一次调用，不会挂死整个
   MCP 进程；
 - **并发模型**：`tools/call` 投给唯一工作线程串行执行（保 AI「读-改-读」
   次序），其余消息（握手 / `ping` / 通知）在 stdin 线程就地处理；
 - **取消**：客户端发 `notifications/cancelled` 后，排队中的调用开跑前跳过、
   在途的 `analyze_performance` 在下一轮轮询间隙中止；被取消的请求按协议不回；
-- 桥单客户端：第二个连接要等第一个断开（AI 会话即独占使用）。MCP server 在
-  按下与抬起之间消失时，应用侧会在察觉断连时补一次指针抬起，不会卡在拖动态。
+- MCP 一次挂一条应用连接（新连接替换旧的）。MCP server 在按下与抬起之间
+  消失时，应用侧会在察觉断连时补一次指针抬起，不会卡在拖动态。
 
 ### `fmt` — 排版
 
@@ -145,16 +186,41 @@ Rust 那一档只在**工程根有 `Cargo.toml`** 时才跑：`cargo fmt` 需要
 ### `dev`
 
 ```
-zephyra dev [--release] [--styles <dir>] [--no-watch] [--no-trace] [--manifest-path <p>]
+zephyra dev [--styles <dir>] [--no-watch] [--no-trace] [--manifest-path <p>] [--log <file>]
 ```
 
+- **只跑 debug**：dev 是开发调试入口，没有 `--release`；要发布产物用
+  `zephyra build`，然后直接执行目标二进制。
 - 默认开 `ZEPHYRA_TRACE=1`。不打开的话开发期最需要的那些行（视口变化、每帧四边形
   数、重建了没有）全都不打，而它们恰恰是排查「窗口变了但内容没跟上」的唯一判据。
-- 默认盯 `styles/` 下的 `.zstyle`；`zephyra new` 生成的项目把样式放在 `frontend/`，
-  因此使用 `zephyra dev --styles frontend`。样式表或 `ZephyraUI.json` 变化后会**重启进程**
-  （不是运行期热重载：
-  重启更简单、不会残留已解析的旧样式表，而 Rust 侧的增量编译本来就已经把等待压得很小）。
-- 刻意**不**盯 `.rs` —— 那是 cargo 自己的事，两个 watcher 管同一份代码会互相触发。
+- 对应 `tauri dev` 的**Rust 热编译**：监视工程根目录下递归的 `.rs`、`Cargo.toml`、
+  `zephyra.toml`，外加 `ZephyraUI.json`。改动后杀掉旧进程、重跑 `cargo run`
+  （增量编译即 Rust 侧热编译），然后继续监视；`target/` / `.git/` /
+  `node_modules/` 与 `Cargo.lock` 被忽略，避免构建产物误触发重启。
+- **`.zstyle` / `.zypui` 不重启进程**：dev 把资源目录经 `ZEPHYRA_DEV_ASSETS`
+  交给应用，由应用自己在进程内替换样式表 / UI 实例（真正的热重载）。这部分
+  代码在框架侧由 `#[cfg(debug_assertions)]` 守卫，**release 构建里不存在**，
+  也不读任何 dev 环境变量；release 仍走 `include_bytes!` 的零解析路径。
+- `zephyra new` 生成的项目把样式放在 `frontend/`，`--styles <dir>` 用于样式在
+  工程**外**的场景；两个目录都会交给应用监视。
+- `--no-watch` 关掉监视，也不把资源目录交给应用，只跑一次（`cargo run` 退出即返回）。
+
+### `build`
+
+```
+zephyra build [--debug] [--release] [--sf] [--manifest-path <p>] [--log <file>]
+```
+
+- **无参数 = release**；`--release` 是同一行为的显式写法，`--debug` 切到 debug；
+  两个都给报用法错。
+- **两种链接模式**（CLI 通过 `ZEPHYRA_LINK_MODE` 传给依赖库的 build script，
+  不猜 app 的依赖图）：
+  - 默认**普通模式**：配置与资源不内嵌，app 运行时从磁盘读；依赖
+    `zephyra-video` 的 app 把编解码器链成外部共享库（`.dll`/`.so`/`.dylib`），
+    与 exe 同目录分发。启动时缺库会给明确错误并退 3。
+  - `--sf`：**单文件模式**，内嵌配置与资源、库静态链接，产物只有一个 exe。
+- 转交 `cargo build`。`run` 命令已移除：要运行产物就 `zephyra build` 后
+  直接执行 `target/release/<app>`（debug 产物走 `cargo run` 或 `zephyra dev`）。
 
 ## 退出码
 

@@ -48,7 +48,7 @@ fn parses_subcommand_and_positional() {
 
 #[test]
 fn flags_and_options_split() {
-    let ParseOutcome::Parsed(a) = args::parse(argv("run --release --manifest-path x/Cargo.toml"))
+    let ParseOutcome::Parsed(a) = args::parse(argv("build --release --manifest-path x/Cargo.toml"))
     else {
         panic!("expected Parsed");
     };
@@ -59,7 +59,7 @@ fn flags_and_options_split() {
 #[test]
 fn value_flags_accept_space_separated_form() {
     // 命令表里写着 `--manifest-path <p>`，解析器就必须认空格形式。
-    let ParseOutcome::Parsed(a) = args::parse(argv("run --manifest-path x/Cargo.toml --release"))
+    let ParseOutcome::Parsed(a) = args::parse(argv("build --manifest-path x/Cargo.toml --release"))
     else {
         panic!("expected Parsed");
     };
@@ -78,7 +78,7 @@ fn value_flag_without_argument_is_a_usage_error() {
 }
 #[test]
 fn double_dash_stops_flag_parsing() {
-    let ParseOutcome::Parsed(a) = args::parse(argv("run -- --nocapture")) else {
+    let ParseOutcome::Parsed(a) = args::parse(argv("build -- --nocapture")) else {
         panic!("expected Parsed");
     };
     // `--nocapture` 必须留在位置参数里，不能变成标志。
@@ -92,11 +92,72 @@ fn repeated_flag_is_counted() {
         panic!("expected Parsed");
     };
     assert_eq!(a.count("force"), 2);
+    // 值与次数存在同一条记录里，遍历只出现一次（不会因重复给而列两遍）。
+    assert_eq!(a.flags().collect::<Vec<_>>(), vec!["force"]);
+    assert!(a.has("force"));
+    assert_eq!(a.option("force"), None);
+}
+
+/// 取值选项同样记次数；重复给值时保留**第一次**的值（与旧的三 Vec 实现一致）。
+#[test]
+fn value_option_records_occurrences_and_keeps_first_value() {
+    let ParseOutcome::Parsed(a) = args::parse(argv("bridge --port 1 --host h --port 2 stats"))
+    else {
+        panic!("expected Parsed");
+    };
+    assert_eq!(a.count("port"), 2);
+    assert_eq!(a.option("port"), Some("1"));
+    assert_eq!(
+        a.options().collect::<Vec<_>>(),
+        vec![("port", "1"), ("host", "h")]
+    );
+    // 重复给的标志/选项不该被当成位置参数漏进桥命令里。
+    assert_eq!(a.positional, vec!["stats"]);
+}
+
+/// 哈希表的迭代顺序不确定，但报错与门禁按 argv 顺序遍历 —— 输出必须可复现。
+#[test]
+fn parsed_args_iterate_in_argv_order() {
+    let ParseOutcome::Parsed(a) = args::parse(argv("dev --no-trace --no-watch")) else {
+        panic!("expected Parsed");
+    };
+    assert_eq!(a.flags().collect::<Vec<_>>(), vec!["no-trace", "no-watch"]);
+}
+
+/// `--help` 在命令后 ⇒ 只打那个命令的帮助；在命令前 ⇒ 全局帮助。
+#[test]
+fn help_targets_the_command_when_given_after_it() {
+    assert_eq!(args::parse(argv("--help")), ParseOutcome::Help(None));
+    assert_eq!(
+        args::parse(argv("dev --help")),
+        ParseOutcome::Help(Some("dev".into()))
+    );
+    assert_eq!(
+        args::parse(argv("build -h")),
+        ParseOutcome::Help(Some("build".into()))
+    );
+}
+
+/// 子命令帮助只包含自己：about、位置参数、声明的选项与退出码。
+#[test]
+fn command_help_is_scoped_to_that_command() {
+    let dev = commands::find("dev").expect("dev must exist");
+    let help = commands::render_command_help("zephyra", "0.0.0", dev);
+    assert!(help.contains("zephyra dev"), "{help}");
+    assert!(help.contains("--no-watch"), "{help}");
+    assert!(
+        !help.contains("zephyra build"),
+        "子命令帮助不该列出其它命令: {help}"
+    );
+    for o in dev.options {
+        assert!(help.contains(o.help), "缺选项说明 {}", o.name);
+    }
+    assert!(help.contains("EXIT CODES"));
 }
 
 #[test]
 fn help_and_version_are_distinguished() {
-    assert_eq!(args::parse(argv("--help")), ParseOutcome::Help);
+    assert_eq!(args::parse(argv("--help")), ParseOutcome::Help(None));
     assert_eq!(args::parse(argv("--version")), ParseOutcome::Version);
     // 空 argv 由 dispatch 处理成「打帮助」，parser 只管给出「没有命令」。
     match args::parse(argv("")) {
@@ -313,17 +374,61 @@ fn display_name_matches_what_the_user_types() {
 #[test]
 fn dev_is_registered_with_its_flags() {
     let dev = commands::find("dev").expect("`dev` must be in the command table");
-    for f in ["release", "no-watch", "no-trace"] {
-        assert!(dev.flags.contains(&f), "`dev` should accept --{f}");
+    for f in ["no-watch", "no-trace"] {
+        assert!(dev.accepts_flag(f), "`dev` should accept --{f}");
     }
+    assert!(
+        !dev.accepts_flag("release"),
+        "dev 只跑 debug；要 release 用 build --release"
+    );
     let help = commands::render_help("zephyra", "0.0.0");
     assert!(help.contains("dev"), "`--help` must list `dev`");
 }
+
+/// dev 永远 debug，run 命令已移除，发布只能走 build。
+#[test]
+fn profile_flags_belong_to_build_only() {
+    assert!(commands::find("run").is_none(), "`run` 命令应已移除");
+    let build = commands::find("build").expect("`build` must exist");
+    assert!(build.accepts_flag("debug"));
+    assert!(build.accepts_flag("release"));
+
+    // dev --release 解析出来只是个普通 flag，门禁会把它当 unknown flag 拒绝。
+    let ParseOutcome::Parsed(a) = args::parse(argv("dev --release")) else {
+        panic!("expected Parsed")
+    };
+    assert!(a.has("release")); // 解析器认得，但命令表不认（见 entry 门禁）
+}
+
+/// `--sf` 只属于 build；pack 还没做，不该出现在命令表里。
+#[test]
+fn build_supports_sf_mode() {
+    let build = commands::find("build").expect("build must exist");
+    assert!(build.accepts_flag("sf"));
+    assert!(commands::find("pack").is_none(), "pack 推迟到后续实现");
+    let ParseOutcome::Parsed(a) = args::parse(argv("build --sf")) else {
+        panic!("expected Parsed")
+    };
+    assert!(a.has("sf"));
+}
+
+/// build 的两种 profile 声明：默认 release，--debug 切 debug。
+#[test]
+fn build_profile_flags_are_declared() {
+    let build = commands::find("build").expect("`build` must exist");
+    assert!(build.accepts_flag("debug"));
+    assert!(build.accepts_flag("release"));
+    let ParseOutcome::Parsed(a) = args::parse(argv("build --debug")) else {
+        panic!("expected Parsed")
+    };
+    assert!(a.has("debug"));
+    assert!(!a.has("release"));
+}
 /// `dev --styles <dir>` 是**取值型**标志。
 ///
-/// 实测踩过：`--styles` 只被加进了「允许的选项」白名单、没加进 `VALUE_FLAGS`，
-/// 于是解析器把它当成布尔标志、目录名漏成位置参数 —— 报的还是
+/// 实测踩过：`--styles` 曾被当成布尔标志解析，目录名漏成位置参数 —— 报的还是
 /// 「unknown flag `--styles`」，即用户完全看不到真正的原因（他传了合法的标志）。
+/// 现在它只在 `dev` 的 `options` 里声明为 `ArgKind::Value`，解析自动跟上。
 #[test]
 fn dev_styles_flag_is_parsed_as_a_value() {
     let ParseOutcome::Parsed(a) = args::parse(argv("dev --styles styles --no-watch")) else {
@@ -334,40 +439,92 @@ fn dev_styles_flag_is_parsed_as_a_value() {
     assert!(a.positional.is_empty(), "{:?}", a.positional);
 }
 
-/// 守卫：`VALUE_FLAGS` 与命令表里写的取值型选项必须一致。
+/// 守卫：每个**声明为取值型**的选项都必须真的被解析器当成取值。
 ///
-/// 两处各写一份是「改 A 忘了改 B」的典型温床，所以这条用例**扫整张命令表**
-/// —— 命令表里凡是写成 `--xxx <...>` 的，都必须在 `VALUE_FLAGS` 里。
+/// 过去这里守的是「帮助字符串里写的 `--xxx <...>` 要在 `VALUE_FLAGS` 里」——
+/// 如今帮助字符串不再手写选项，声明只在 `Command::options` 一处。于是门禁改成
+/// 直接扫声明：凡是 `ArgKind::Value` 的，`args::parse` 都必须把下一个参数吃成
+/// 值，而不是漏成位置参数。
 ///
 /// # 为什么这条门禁重要
 ///
-/// 不在名单里的取值型选项会被解析成「一个布尔标志 + 一个位置参数」。
-/// 而 `perf` / `debug` 的位置参数是**桥命令** —— 那个被漏下的值会被拼进
-/// 命令里，于是应用收到一条莫名其妙的命令，而 CLI 那边**一切正常**
-/// （退出码 0，输出看着像样）。
+/// 漏掉的取值型选项会被解析成「一个布尔标志 + 一个位置参数」。而 `perf` /
+/// `debug` 的位置参数是**桥命令** —— 那个被漏下的值会被拼进命令里，于是应用
+/// 收到一条莫名其妙的命令，而 CLI 那边**一切正常**（退出码 0，输出看着像样）。
 #[test]
-fn value_flags_cover_every_option_the_commands_document() {
+fn every_declared_value_option_is_parsed_as_a_value() {
     for cmd in commands::COMMANDS {
-        let mut rest = cmd.args;
-        while let Some(start) = rest.find("--") {
-            rest = &rest[start + 2..];
-            let Some(end) = rest.find(|c: char| c.is_whitespace() || c == ']') else {
-                break;
-            };
-            let name = &rest[..end];
-            rest = &rest[end..];
-            // 只看**取值型**的（`--xxx <...>`）：布尔标志后面没有 `<`。
-            let Some(after) = rest.trim_start().strip_prefix('<') else {
+        for spec in cmd.options {
+            if spec.kind != zephyra_cli::args::ArgKind::Value {
                 continue;
-            };
-            let _ = after;
+            }
             assert!(
-                args::VALUE_FLAGS.contains(&name),
-                "`{}` 文档里的 `--{name}` 取值，但不在 VALUE_FLAGS 里",
-                cmd.name
+                args::is_value_flag(spec.name),
+                "`{}` 声明了取值选项 `--{}`，但解析器不认",
+                cmd.name,
+                spec.name
+            );
+            let ParseOutcome::Parsed(a) = args::parse(vec![
+                cmd.name.to_string(),
+                format!("--{}", spec.name),
+                "probe".to_string(),
+            ]) else {
+                panic!("parse failed for {} --{}", cmd.name, spec.name)
+            };
+            assert_eq!(
+                a.option(spec.name),
+                Some("probe"),
+                "`{} --{}` 没把值吃进来",
+                cmd.name,
+                spec.name
+            );
+            assert!(
+                a.positional.is_empty(),
+                "`{} --{}` 的值漏成了位置参数：{:?}",
+                cmd.name,
+                spec.name,
+                a.positional
             );
         }
     }
+}
+
+/// 帮助里的选项说明来自同一份声明：每个 `help` 文本都要出现在 `--help` 里。
+#[test]
+fn help_documents_every_declared_option() {
+    let help = commands::render_help("zephyra", "0.0.0");
+    for cmd in commands::COMMANDS {
+        for spec in cmd.options {
+            assert!(
+                help.contains(spec.help),
+                "`--help` 里没有 `{}` 的 `--{}` 说明",
+                cmd.name,
+                spec.name
+            );
+            // 声明显示形态（`--name <value>`）也必须出现在帮助里。
+            assert!(
+                help.contains(&spec.display()),
+                "`--help` 里没有 `{}` 的选项形态 `{}`",
+                cmd.name,
+                spec.display()
+            );
+        }
+    }
+}
+
+/// `-h` / `-V` 是帮助里承诺的全局别名，必须与长名等价。
+#[test]
+fn short_aliases_resolve_to_help_and_version() {
+    assert_eq!(
+        args::parse(argv("check -h")),
+        ParseOutcome::Help(Some("check".into()))
+    );
+    assert_eq!(args::parse(argv("check -V")), ParseOutcome::Version);
+    // `--` 之后的一切仍是位置参数，别名不生效。
+    let ParseOutcome::Parsed(a) = args::parse(argv("build -- -h")) else {
+        panic!("expected Parsed")
+    };
+    assert!(a.positional.contains(&"-h".to_string()));
 }
 
 #[test]
@@ -544,7 +701,7 @@ fn scaffold_entry_implements_every_required_trait_method() {
 
 /// `zephyra bridge log <file> [--tail N]`：读**本地**日志，不需要连上应用。
 ///
-/// 这条命令存在的意义是「应用跑着，你看它的输出」—— 而日志是 `run --log` /
+/// 这条命令存在的意义是「应用跑着，你看它的输出」—— 而日志是 `build --log` /
 /// `dev --log` 落下来的那份。
 #[test]
 fn bridge_log_prints_the_tail_without_needing_an_app() {
@@ -613,9 +770,9 @@ fn perf_and_debug_are_registered_and_documented() {
     }
 }
 
-/// `perf` / `debug` 的取值型标志必须进 `VALUE_FLAGS`。
+/// `perf` / `debug` 的取值型标志必须被解析成取值。
 ///
-/// ⚠ 这不是「多写一份名单」的问题：不列进去，`--duration-ms 2000` 会被解析成
+/// ⚠ 这不是「多写一份名单」的问题：声明错了，`--duration-ms 2000` 会被解析成
 /// 「一个叫 `duration-ms` 的布尔标志 + 一个位置参数 `2000`」—— 而
 /// `debug watch` 的位置参数是**桥命令**，那个 `2000` 就会被拼进命令里，
 /// 于是应用收到一条莫名其妙的命令，而 CLI 那边**一切正常**。
@@ -702,7 +859,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
 #[test]
 fn fmt_is_registered_with_the_check_flag() {
     let cmd = commands::find("fmt").expect("`fmt` must be in the command table");
-    assert!(cmd.flags.contains(&"check"), "`fmt` should accept --check");
+    assert!(cmd.accepts_flag("check"), "`fmt` should accept --check");
     let help = commands::render_help("zephyra", "0.0.0");
     assert!(help.contains("fmt"), "`--help` must list `fmt`");
 }

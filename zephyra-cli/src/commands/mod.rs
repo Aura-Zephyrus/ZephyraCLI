@@ -19,22 +19,73 @@
 //! 没有 `migrate` / `sign` / `updater` —— 那些对应 Tauri 的分发体系，ZephyraUI
 //! 现在没有，加进来就是空壳。
 
-use crate::args::Args;
+use crate::args::{ArgKind, ArgSpec, Args};
 use crate::ExitCode;
+
+/// 应用连入 MCP 的端口环境变量。由 CLI 在启动应用时注入；应用侧
+/// `zephyra_fx::bridge::MCP_PORT_ENV` 读同一个名字（测试钉住一致性）。
+pub const MCP_PORT_ENV: &str = "ZEPHYRA_MCP_PORT";
+/// dev 把资源目录交给应用的变量名。应用侧 `zephyra_fx::dev_reload` 读取；
+/// release 构建里没有任何代码读它（热重载模块被 cfg 剔除）。
+pub const DEV_ASSETS_ENV: &str = "ZEPHYRA_DEV_ASSETS";
+/// 默认监听端口，与 `zephyra_bridge_port()` / MCP 默认端口一致。
+pub const DEFAULT_MCP_PORT: u16 = 7878;
+
+/// CLI 进程自己的 `ZEPHYRA_MCP_PORT`（没有就用默认值），转发给应用子进程。
+/// MCP 也用同一个变量决定监听端口，所以一处设置两端自动对齐。
+pub(crate) fn mcp_port_for_child() -> String {
+    std::env::var(MCP_PORT_ENV).unwrap_or_else(|_| DEFAULT_MCP_PORT.to_string())
+}
 
 pub struct Command {
     pub name: &'static str,
     pub about: &'static str,
-    /// 位置参数说明。
+    /// **位置参数**说明（不含选项 —— 选项由 `options` 生成）。
     pub args: &'static str,
-    /// 这个命令**认**的布尔标志。
+    /// 这个命令认的全部选项：布尔标志 + 取值选项。
     ///
-    /// ⚠ 这张表存在的唯一理由是「未知标志要报错」。
-    /// 实测踩过：`zephyra check --strictness` 曾经安静通过、exit 0，看起来
-    /// 像是「开了严格模式跑过了」，其实那个标志根本没生效 —— 而用户以为自己
-    /// 已经收紧了检查。这类静默忽略比报错糟得多。
-    pub flags: &'static [&'static str],
+    /// ⚠ 这是选项元数据的**唯一**来源。解析器查它决定 `--name` 是否取值，
+    /// 门禁查它判断标志属不属于本命令，`render_help` 从它生成帮助 ——
+    /// 三者读同一份声明，结构上不可能出现「改了 A 忘了改 B」的漂移。
+    ///
+    /// 这也顺手治掉了老毛病：`zephyra check --strictness` 以前安静通过、
+    /// exit 0，看起来像「开了严格模式跑过了」，其实那个标志根本没生效。
+    pub options: &'static [ArgSpec],
     pub run: fn(&Args, &mut dyn Write) -> Result<ExitCode, CliError>,
+}
+
+impl Command {
+    /// 本命令是否声明了名为 `name` 的布尔标志。
+    pub fn accepts_flag(&self, name: &str) -> bool {
+        self.options
+            .iter()
+            .any(|o| o.name == name && o.kind == ArgKind::Flag)
+    }
+
+    /// 本命令是否声明了名为 `name` 的取值选项。
+    pub fn accepts_value(&self, name: &str) -> bool {
+        self.options
+            .iter()
+            .any(|o| o.name == name && o.kind == ArgKind::Value)
+    }
+
+    /// 报错时展示的布尔标志名单。
+    pub fn accepted_flags(&self) -> Vec<&'static str> {
+        self.options
+            .iter()
+            .filter(|o| o.kind == ArgKind::Flag)
+            .map(|o| o.name)
+            .collect()
+    }
+
+    /// 报错时展示的取值选项名单。
+    pub fn accepted_values(&self) -> Vec<&'static str> {
+        self.options
+            .iter()
+            .filter(|o| o.kind == ArgKind::Value)
+            .map(|o| o.name)
+            .collect()
+    }
 }
 
 /// 统一的输出端。抽出来是为了**能测**：命令往 stdout/stderr 写东西时，
@@ -90,85 +141,130 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "new",
         about: "scaffold a new ZephyraUI project",
-        args: "<name> [--path <dir>]",
-        flags: &["force"],
+        args: "<name>",
+        options: &[
+            ArgSpec::value("path", "dir", "create the project in this directory"),
+            ArgSpec::flag("force", "overwrite the target directory if it exists"),
+        ],
         run: new::run,
     },
     Command {
         name: "check",
         about: "check one or more stylesheets",
-        args: "<file.zstyle>... [--format human|json]",
-        flags: &[],
+        args: "<file.zstyle>...",
+        options: &[ArgSpec::value(
+            "format",
+            "fmt",
+            "output format: human or json",
+        )],
         run: check::run,
     },
     Command {
         name: "fmt",
         about: "format project sources: .zstyle / .zypui / Rust (via cargo fmt)",
-        args: "[<path>...] [--check] [--manifest-path <p>]",
-        flags: &["check"],
+        args: "[<path>...]",
+        options: &[
+            ArgSpec::flag("check", "report files that would change, do not write"),
+            ArgSpec::value("manifest-path", "p", "path to Cargo.toml"),
+        ],
         run: fmt::run,
     },
     Command {
         name: "dev",
-        about: "run in dev mode: tracing on, restarts when a stylesheet changes",
-        args: "[--release] [--styles <dir>] [--no-watch] [--no-trace] [--manifest-path <p>] [--log <file>]",
-        flags: &["release", "no-watch", "no-trace"],
+        about: "run in dev mode (debug only): hot-reload Rust and assets",
+        args: "",
+        options: &[
+            ArgSpec::value("styles", "dir", "directory of stylesheets to watch"),
+            ArgSpec::flag("no-watch", "do not restart when files change"),
+            ArgSpec::flag("no-trace", "disable ZEPHYRA_TRACE output"),
+            ArgSpec::value("manifest-path", "p", "path to Cargo.toml"),
+            ArgSpec::value("log", "file", "also write child output to this file"),
+        ],
         run: dev::run,
     },
     Command {
-        name: "run",
-        about: "run a ZephyraUI app (debug)",
-        args: "[--release] [--manifest-path <p>] [--log <file>]",
-        flags: &["release"],
-        run: run::run,
-    },
-    Command {
         name: "build",
-        about: "build a ZephyraUI app",
-        args: "[--release] [--manifest-path <p>] [--log <file>]",
-        flags: &["release"],
+        about: "build a ZephyraUI app (default: release)",
+        args: "",
+        options: &[
+            ArgSpec::flag("debug", "build in debug mode (default is release)"),
+            ArgSpec::flag("release", "build in release mode (default)"),
+            ArgSpec::flag("sf", "single file: embed config and assets into the exe"),
+            ArgSpec::value("manifest-path", "p", "path to Cargo.toml"),
+            ArgSpec::value("log", "file", "also write child output to this file"),
+        ],
         run: build::build,
     },
     Command {
         name: "info",
         about: "print versions and toolchain status",
         args: "",
-        flags: &[],
+        options: &[],
         run: info::run,
     },
     Command {
         name: "props",
         about: "list every supported stylesheet property",
         args: "",
-        flags: &[],
+        options: &[],
         run: props::run,
     },
     Command {
         name: "mcp",
-        about: "MCP server: let AI agents inspect and drive a running ZephyraUI app",
-        args: "[--port <n>] [--host <addr>]",
-        flags: &[],
+        about: "MCP server bound to the agent (stdio); the app connects in",
+        args: "",
+        options: &[
+            ArgSpec::value("port", "n", "port MCP listens on for the app to connect to"),
+            ArgSpec::value("host", "addr", "address MCP listens on for app connections"),
+        ],
         run: mcp::run,
     },
     Command {
         name: "bridge",
         about: "talk to a running app's debug bridge directly (one process, many commands)",
-        args: "[--port <n>] [--host <addr>] [--stdin] [--list] <command>... | log <file> [--tail <n>]",
-        flags: &["stdin", "list"],
+        args: "<command>... | log <file>",
+        options: &[
+            ArgSpec::value("port", "n", "TCP port of the debug bridge"),
+            ArgSpec::value("host", "addr", "host of the debug bridge"),
+            ArgSpec::flag("stdin", "read one bridge command per line from stdin"),
+            ArgSpec::flag("list", "list reachable app instances"),
+            ArgSpec::value("tail", "n", "with `log`, print only the last N lines"),
+        ],
         run: bridge::run,
     },
     Command {
         name: "perf",
         about: "performance monitor for a running app (profile / watch)",
-        args: "profile|watch [--port <n>] [--host <addr>] [--seconds <n>] [--interval-ms <n>] [--duration-ms <n>]",
-        flags: &[],
+        args: "profile|watch",
+        options: &[
+            ArgSpec::value("port", "n", "TCP port of the debug bridge"),
+            ArgSpec::value("host", "addr", "host of the debug bridge"),
+            ArgSpec::value("seconds", "n", "sample duration in seconds (profile)"),
+            ArgSpec::value("interval-ms", "n", "poll interval in milliseconds (watch)"),
+            ArgSpec::value(
+                "duration-ms",
+                "n",
+                "total observation window in milliseconds (watch)",
+            ),
+        ],
         run: perf::run,
     },
     Command {
         name: "debug",
         about: "debugger for a running app (watch / tree / snapshot / diff)",
-        args: "watch|tree|snapshot|diff [--port <n>] [--host <addr>] [--interval-ms <n>] [--duration-ms <n>] [--depth <n>] [--all] <args>...",
-        flags: &["all"],
+        args: "watch|tree|snapshot|diff <args>...",
+        options: &[
+            ArgSpec::value("port", "n", "TCP port of the debug bridge"),
+            ArgSpec::value("host", "addr", "host of the debug bridge"),
+            ArgSpec::value("interval-ms", "n", "poll interval in milliseconds"),
+            ArgSpec::value(
+                "duration-ms",
+                "n",
+                "total observation window in milliseconds",
+            ),
+            ArgSpec::value("depth", "n", "maximum child depth to print"),
+            ArgSpec::flag("all", "print every node"),
+        ],
         run: debug::run,
     },
 ];
@@ -178,6 +274,9 @@ pub fn find(name: &str) -> Option<&'static Command> {
 }
 
 /// 渲染帮助。**从表里生成**，所以「帮助里有的」一定「真能跑」。
+///
+/// 选项那几行直接来自 [`Command::options`]：名字、是否取值、值名、说明都在
+/// 那里声明一次。因此「加了选项忘了写帮助」和「写了帮助忘了实现」都不再可能。
 pub fn render_help(bin: &str, version: &str) -> String {
     let mut s = String::new();
     s.push_str(&format!("{bin} {version}\nZephyraUI command line interface\n\nUSAGE\n    {bin} <command> [options]\n\nCOMMANDS\n"));
@@ -189,17 +288,83 @@ pub fn render_help(bin: &str, version: &str) -> String {
     s.push_str("    --help, -h        this text\n");
     s.push_str("    --version, -V     print version\n");
     s.push('\n');
-    for c in COMMANDS {
+
+    // 先把每个选项的展示形态算**一次**：列宽、USAGE、说明行都要用它，
+    // 反复调 `display()` 会为每个选项分配三次 String。
+    let displays: Vec<Vec<String>> = COMMANDS
+        .iter()
+        .map(|c| c.options.iter().map(ArgSpec::display).collect())
+        .collect();
+    // 选项列宽取全局最大值：跨命令对齐，扫起来不费劲。
+    let ow = displays
+        .iter()
+        .flatten()
+        .map(String::len)
+        .max()
+        .unwrap_or(0);
+
+    for (c, ds) in COMMANDS.iter().zip(displays.iter()) {
+        s.push_str(&format!("USAGE\n    {bin} {}", c.name));
         if !c.args.is_empty() {
-            s.push_str(&format!("USAGE\n    {bin} {} {}\n\n", c.name, c.args));
+            s.push(' ');
+            s.push_str(c.args);
         }
+        for d in ds {
+            s.push_str(" [");
+            s.push_str(d);
+            s.push(']');
+        }
+        s.push('\n');
+        if !ds.is_empty() {
+            s.push('\n');
+            for (d, o) in ds.iter().zip(c.options.iter()) {
+                s.push_str(&format!("    {:ow$}    {}\n", d, o.help, ow = ow));
+            }
+        }
+        s.push('\n');
     }
+    push_exit_codes(&mut s);
+    s
+}
+
+/// 单个子命令的详细帮助（`zephyra <cmd> --help`）。
+///
+/// 与全局帮助同源：命令的 about / args / options 全部来自命令表，所以这里
+/// 不可能出现「帮助里写了但命令不认」的选项。
+pub fn render_command_help(bin: &str, version: &str, cmd: &Command) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("{bin} {version}\n\nUSAGE\n    {bin} {}", cmd.name));
+    if !cmd.args.is_empty() {
+        s.push(' ');
+        s.push_str(cmd.args);
+    }
+    for o in cmd.options {
+        s.push_str(" [");
+        s.push_str(&o.display());
+        s.push(']');
+    }
+    s.push_str("\n\n");
+    s.push_str(cmd.about);
+    s.push_str("\n\nOPTIONS\n");
+
+    let mut rows: Vec<(String, &str)> = cmd.options.iter().map(|o| (o.display(), o.help)).collect();
+    rows.push(("--help, -h".to_string(), "this text"));
+    rows.push(("--version, -V".to_string(), "print version"));
+    let ow = rows.iter().map(|(d, _)| d.len()).max().unwrap_or(0);
+    for (display, help) in rows {
+        s.push_str(&format!("    {:ow$}    {}\n", display, help, ow = ow));
+    }
+    s.push('\n');
+    push_exit_codes(&mut s);
+    s
+}
+
+fn push_exit_codes(s: &mut String) {
     s.push_str("EXIT CODES\n");
     s.push_str("    0  success\n");
     s.push_str("    1  the action failed (check found errors, build failed, ...)\n");
     s.push_str("    2  bad usage (unknown command, missing argument)\n");
     s.push_str("    3  environment is missing (no cargo, directory already exists)\n");
-    s
 }
 
 mod bridge;
@@ -213,7 +378,6 @@ mod mcp;
 mod new;
 mod perf;
 mod props;
-mod run;
 
 /// 找 cargo。没有它时给**明确**的缺环境错误，而不是让调用方看到一条奇怪的 spawn 失败。
 pub fn cargo_path() -> Result<std::path::PathBuf, CliError> {
@@ -231,8 +395,12 @@ pub fn cargo_path() -> Result<std::path::PathBuf, CliError> {
     })
 }
 
-pub fn app_config_path(a: &Args) -> Result<Option<std::path::PathBuf>, CliError> {
-    let root = match a.option("manifest-path") {
+/// 工程根目录：`--manifest-path` 的父目录，否则 cwd。
+///
+/// `dev` 的源码/资源监视与窗口配置解析共用这一份判据，避免「配置在 A 目录、
+/// 监视却盯着 B 目录」这种漂移。
+pub fn project_root(a: &Args) -> Result<std::path::PathBuf, CliError> {
+    match a.option("manifest-path") {
         Some(manifest) => {
             let manifest = std::path::PathBuf::from(manifest);
             let manifest = if manifest.is_absolute() {
@@ -242,14 +410,18 @@ pub fn app_config_path(a: &Args) -> Result<Option<std::path::PathBuf>, CliError>
                     .map_err(|e| CliError::failure(format!("cannot get current directory: {e}")))?
                     .join(manifest)
             };
-            manifest
+            Ok(manifest
                 .parent()
                 .map(std::path::Path::to_path_buf)
-                .unwrap_or(manifest)
+                .unwrap_or(manifest))
         }
         None => std::env::current_dir()
-            .map_err(|e| CliError::failure(format!("cannot get current directory: {e}")))?,
-    };
+            .map_err(|e| CliError::failure(format!("cannot get current directory: {e}"))),
+    }
+}
+
+pub fn app_config_path(a: &Args) -> Result<Option<std::path::PathBuf>, CliError> {
+    let root = project_root(a)?;
     let config = root.join("ZephyraUI.json");
     if !config.is_file() {
         return Ok(None);
@@ -301,6 +473,8 @@ pub fn spawn_inherit<S: AsRef<std::ffi::OsStr>>(
         if let Some(path) = config_path {
             command.env("ZEPHYRA_APP_CONFIG_PATH", path);
         }
+        // 告诉应用 MCP 在哪：应用启动后主动连入，agent 只经 stdio 与 MCP 说话。
+        command.env(MCP_PORT_ENV, mcp_port_for_child());
         let status = command
             .status()
             .map_err(|e| CliError::missing(format!("cannot run {}: {e}", program.display())))?;
@@ -384,6 +558,8 @@ pub fn spawn_pumped<S: AsRef<std::ffi::OsStr>>(
     if let Some(path) = config_path {
         command.env("ZEPHYRA_APP_CONFIG_PATH", path);
     }
+    // 告诉应用 MCP 在哪：应用启动后主动连入，agent 只经 stdio 与 MCP 说话。
+    command.env(MCP_PORT_ENV, mcp_port_for_child());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
     let mut child = command
