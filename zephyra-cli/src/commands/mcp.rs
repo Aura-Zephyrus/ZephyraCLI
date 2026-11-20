@@ -46,7 +46,7 @@ use crate::bridge_client::{BridgeClient, BridgeResponse};
 use crate::{args::Args, ExitCode};
 
 use std::io::BufRead;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
@@ -104,7 +104,9 @@ const MUTATES: &str = r#"{"readOnlyHint": false, "destructiveHint": false}"#;
 const TOOLS: &[Tool] = &[
     Tool {
         name: "get_app_info",
-        description: "Identity the connected app reported when it linked to this MCP server         (`hello <app-name> <version>`). Use it to tell which app and framework version you are         driving. Needs no bridge round-trip and works before any other tool call.",
+        description: "Identity the connected app reported when it linked to this MCP server \
+(`hello <app-name> <version>`). Use it to tell which app and framework version you are \
+driving. Needs no bridge round-trip and works before any other tool call.",
         schema: r#"{"type": "object", "properties": {}}"#,
         annotations: READ_ONLY,
     },
@@ -324,14 +326,18 @@ pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
              （用 `zephyra mcp --port <n>` 换端口，并让 dev/run 的 ZEPHYRA_MCP_PORT 跟上）"
         ))
     })?;
-    let (app_tx, app_rx) = mpsc::channel::<TcpStream>();
+    let (app_tx, app_rx) = mpsc::channel::<(BridgeClient, Option<String>)>();
     std::thread::Builder::new()
         .name("zephyra-mcp-app-accept".into())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
-                        if app_tx.send(s).is_err() {
+                        // 身份帧在这里读，不占工具工作线程：应用帧循环停摆时
+                        // read_hello 最坏阻塞几百 ms，MCP 期间必须继续应答工具调用。
+                        let mut client = BridgeClient::from_stream(s);
+                        let identity = client.read_hello();
+                        if app_tx.send((client, identity)).is_err() {
                             break;
                         }
                     }
@@ -354,9 +360,9 @@ pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
             let mut session = Session::inbound(&worker_host, port, worker_cancelled);
             loop {
                 // 先收应用连入（非阻塞）；应用重启后会自动重连进来。
-                if let Ok(stream) = app_rx.try_recv() {
+                if let Ok((client, identity)) = app_rx.try_recv() {
                     eprintln!("[zephyra-mcp] app connected");
-                    session.attach(stream);
+                    session.attach(client, identity);
                 }
                 // 再等工具调用；20ms 超时保证 app_rx 不会被饿死。
                 match job_rx.recv_timeout(Duration::from_millis(20)) {
@@ -467,13 +473,11 @@ impl Session {
         }
     }
 
-    /// 应用连入时安放它的 socket。工具线程是唯一调用者。
+    /// 安放已由 accept 线程读完身份行的 client。工具线程是唯一调用者。
     ///
-    /// 先读掉身份行（第一帧），再让出 client —— 否则下一句命令的响应会读到它。
+    /// 身份必须在 accept 线程里先读掉（第一帧），否则下一句命令的响应会读到它。
     /// 当前只挂一条应用流：后连的覆盖先连的，所以覆盖时明确记一条诊断。
-    fn attach(&mut self, stream: TcpStream) {
-        let mut client = BridgeClient::from_stream(stream);
-        let identity = client.read_hello();
+    fn attach(&mut self, client: BridgeClient, identity: Option<String>) {
         match &identity {
             Some(id) => eprintln!("[zephyra-mcp] app hello: {id}"),
             None => eprintln!("[zephyra-mcp] app connected (no hello; legacy app?)"),
@@ -1573,7 +1577,7 @@ mod tests {
         let (port, seen) = mock_bridge("pong");
         let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         let mut session = Session::inbound("127.0.0.1", port, Cancelled::default());
-        session.attach(stream);
+        session.attach(BridgeClient::from_stream(stream), None);
         let r = handle_message(
             r#"{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"ping","arguments":{}}}"#,
             &mut session,

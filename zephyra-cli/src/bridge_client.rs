@@ -86,7 +86,10 @@ impl BridgeClient {
     /// 必须在新连接的第一次 [`Self::call`] **之前**调用：应用把身份作为第一帧
     /// 发出，不先读掉，下一句命令的响应就会读到它，协议整体错位一格。
     ///
-    /// 短超时（200 ms）且兼容旧应用：连上却没发 hello 时返回 `None`，不阻塞 MCP。
+    /// 短超时（200 ms × 4）且兼容旧应用：连上却没发 hello 时返回 `None`。
+    ///
+    /// ⚠ 调用方必须放在**连接接受线程**里，不要占用 MCP 唯一的工作线程 ——
+    /// 应用帧循环停摆时这里最坏阻塞几百 ms，工作线程要继续应答工具调用。
     pub(crate) fn read_hello(&mut self) -> Option<String> {
         self.stream
             .set_read_timeout(Some(std::time::Duration::from_millis(200)))
@@ -108,11 +111,20 @@ impl BridgeClient {
                 return line.strip_prefix("hello ").map(|s| s.to_string());
             }
             match self.stream.read(&mut chunk) {
-                Ok(0) => return None,
+                Ok(0) => {
+                    self.buf.clear();
+                    return None;
+                }
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(_) => return None,
+                Err(_) => {
+                    self.buf.clear();
+                    return None;
+                }
             }
         }
+        // 半行超时：残字节必须丢掉，否则下一句命令的 read_response 会把它
+        // 当成响应开头，协议整体错位一格。
+        self.buf.clear();
         None
     }
 
