@@ -1,0 +1,114 @@
+name: Verify
+
+# 发布前验证：release 模式编译 + MCP 端到端冒烟 + 安装/更新脚本自测。
+# 与 CI（fmt/clippy/test）互补，这里守的是「真正能跑起来、能发出去」。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: release build + MCP smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout ZephyraCLI
+        uses: actions/checkout@v4
+        with:
+          path: ZephyraCLI
+
+      - name: Checkout ZephyraUI (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: Aura-Zephyrus/ZephyraUI
+          path: ZephyraUI
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ZephyraCLI
+
+      - name: Build release
+        working-directory: ZephyraCLI
+        run: cargo build --release --locked -p zephyra-cli
+
+      - name: MCP smoke test
+        working-directory: ZephyraCLI
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Windows) BIN="target/release/zephyra.exe" ;;
+            *)       BIN="target/release/zephyra" ;;
+          esac
+          bash scripts/smoke-mcp.sh "$BIN"
+
+  installers:
+    name: installer scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - name: Checkout ZephyraCLI
+        uses: actions/checkout@v4
+        with:
+          path: ZephyraCLI
+
+      - name: Checkout ZephyraUI (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: Aura-Zephyrus/ZephyraUI
+          path: ZephyraUI
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ZephyraCLI
+
+      - name: Bash installer syntax
+        if: runner.os != 'Windows'
+        working-directory: ZephyraCLI
+        run: |
+          bash -n install.sh
+          bash -n update.sh
+          bash -n test-update.sh
+          bash -n scripts/smoke-mcp.sh
+
+      - name: PowerShell installer syntax
+        if: runner.os == 'Windows'
+        working-directory: ZephyraCLI
+        shell: pwsh
+        run: |
+          foreach ($f in @('install.ps1','update.ps1','test-update.ps1')) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $f), [ref]$null, [ref]$errors) | Out-Null
+            if ($errors.Count -ne 0) { throw "$f has $($errors.Count) parse error(s)" }
+          }
+
+      - name: Local update self-test (bash)
+        if: runner.os != 'Windows'
+        working-directory: ZephyraCLI
+        run: bash test-update.sh
+
+      - name: Local update self-test (PowerShell)
+        if: runner.os == 'Windows'
+        working-directory: ZephyraCLI
+        shell: pwsh
+        run: ./test-update.ps1

@@ -17,8 +17,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: gate (fmt / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ZephyraCLI
+        uses: actions/checkout@v4
+        with:
+          path: ZephyraCLI
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Checkout ZephyraUI (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: Aura-Zephyrus/ZephyraUI
+          path: ZephyraUI
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ZephyraCLI
+
+      - name: fmt / clippy / test
+        working-directory: ZephyraCLI
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --all-targets
+
   build:
     name: build ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

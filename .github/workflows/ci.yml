@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - name: Checkout ZephyraCLI
         uses: actions/checkout@v4
@@ -53,3 +53,8 @@ jobs:
       - name: test
         working-directory: ZephyraCLI
         run: cargo test --workspace --all-targets
+
+      # debug 编译过不代表 release 能过（cfg(debug_assertions) 在两边不同）。
+      - name: release build
+        working-directory: ZephyraCLI
+        run: cargo build --release --workspace
