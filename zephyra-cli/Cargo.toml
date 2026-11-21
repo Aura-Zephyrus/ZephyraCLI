@@ -49,7 +49,5 @@ png = "0.18.1"
 # MCP 的内联截图返回：PNG 字节 → base64（image content）。只在 mcp 子命令用。
 base64 = "0.22"
 
-[dev-dependencies]
-# 仅用于跨仓常量对齐测试，**不进入运行时依赖**。CLI 刻意不依赖 zephyra-fx；
-# dev-dependency 让测试直接引用框架常量，任一侧改端口或 env 名都会让测试变红。
-zephyra-fx = { path = "../../ZephyraUI/zephyra/zephyra-fx" }
+# 无 dev-dependencies：CLI 刻意不依赖主仓任何 crate（含 zephyra-fx）。
+# 桥协议常量（端口 / env 名）在本仓独立写成字面量，由 tests 钉住契约值。

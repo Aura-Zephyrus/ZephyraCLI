@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.87"
-description = "zypuic CLI; compiler library lives in the ZephyraUI workspace"
+description = "zypuic CLI; compiler library lives in the ZephyraCore repo"
 
 [[bin]]
 name = "zypuic"
 path = "src/main.rs"
 
 [dependencies]
-zypui-compile = { path = "../../ZephyraUI/zypui-compile" }
+zypui-compile = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.1.0" }

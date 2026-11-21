@@ -1,0 +1,42 @@
+name: Gate
+description: 'ZephyraCLI quality gate: rustfmt + clippy + tests. Runs entirely within the ZephyraCLI workspace; no sibling repos are needed.'
+
+inputs:
+  working-directory:
+    description: 'Directory containing ZephyraCLI Cargo.toml'
+    required: false
+    default: 'ZephyraCLI'
+  rust-target:
+    description: 'Optional target to add to the toolchain (cross builds)'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+        targets: ${{ inputs.rust-target }}
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ${{ inputs.working-directory }}
+
+    # 退出码与错误文案被测试钉死，这三个门禁一个都不能少。
+    - name: rustfmt
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: cargo fmt --all -- --check
+
+    - name: clippy
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+    - name: test
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: cargo test --workspace --all-targets

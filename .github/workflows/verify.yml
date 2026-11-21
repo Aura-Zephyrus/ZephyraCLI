@@ -26,11 +26,6 @@ jobs:
         with:
           path: ZephyraCLI
 
-      - name: Checkout ZephyraUI (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: Aura-Zephyrus/ZephyraUI
-          path: ZephyraUI
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -67,11 +62,6 @@ jobs:
         with:
           path: ZephyraCLI
 
-      - name: Checkout ZephyraUI (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: Aura-Zephyrus/ZephyraUI
-          path: ZephyraUI
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

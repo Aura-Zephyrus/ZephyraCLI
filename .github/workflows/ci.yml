@@ -9,8 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# 本仓的 zstylec / zypuic 通过 ../../ZephyraUI 引用主仓的编译库，
-# 所以两个仓要并排 checkout（ZephyraCLI/ 与 ZephyraUI/）。
 jobs:
   check:
     name: fmt / clippy / test (${{ matrix.os }})
@@ -25,11 +23,6 @@ jobs:
         with:
           path: ZephyraCLI
 
-      - name: Checkout ZephyraUI (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: Aura-Zephyrus/ZephyraUI
-          path: ZephyraUI
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

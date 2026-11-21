@@ -40,6 +40,7 @@ pub(crate) struct CreateOptions {
     pub no_agent: bool,
     pub git: bool,
     pub check: bool,
+    pub no_default_features: bool,
 }
 
 pub fn run(a: &Args, w: &mut dyn Write) -> Result<ExitCode, CliError> {
@@ -56,6 +57,7 @@ pub fn run(a: &Args, w: &mut dyn Write) -> Result<ExitCode, CliError> {
             no_agent: a.has("no-agent"),
             git: a.has("git"),
             check: a.has("check"),
+            no_default_features: a.has("no-default-features"),
         },
         w,
     )?;
@@ -96,6 +98,7 @@ pub(crate) fn create(
     let no_agent = opts.no_agent;
     let git = opts.git;
     let check = opts.check;
+    let no_default_features = opts.no_default_features;
 
     // Fail before generating anything if the sibling checkout is missing.
     let deps = DependencyPaths::resolve()?;
@@ -167,8 +170,12 @@ pub(crate) fn create(
     if check {
         w.line("running cargo check ...");
         let cargo = super::cargo_path()?;
-        let status = std::process::Command::new(cargo)
-            .arg("check")
+        let mut cmd = std::process::Command::new(cargo);
+        cmd.arg("check");
+        if no_default_features {
+            cmd.arg("--no-default-features");
+        }
+        let status = cmd
             .arg("--manifest-path")
             .arg(root.join("Cargo.toml"))
             .status()
@@ -213,10 +220,10 @@ struct DependencyPaths {
 impl DependencyPaths {
     fn resolve() -> Result<Self, CliError> {
         let paths = Self {
-            core: crate_dep("zephyra/zephyra-core"),
+            core: core_dep("zephyra-core"),
             fx: crate_dep("zephyra/zephyra-fx"),
-            style: crate_dep("zephyra/zephyra-style"),
-            zstyle_compile: crate_dep("zstyle-compile"),
+            style: core_dep("zephyra-style"),
+            zstyle_compile: core_dep("zstyle-compile"),
             d3d12: crate_dep("zephyra/zephyra-base/zephyra-winit-d3d12"),
             winit: crate_dep("zephyra/zephyra-base/zephyra-winit"),
             vulkan: crate_dep("zephyra/zephyra-base/zephyra-vulkan"),
@@ -232,7 +239,7 @@ impl DependencyPaths {
         ] {
             if !std::path::Path::new(p).join("Cargo.toml").exists() {
                 return Err(CliError::missing(format!(
-                    "ZephyraUI checkout not found at {p} — clone it next to ZephyraCLI first"
+                    "dependency checkout not found at {p} — clone ZephyraUI and ZephyraCore next to ZephyraCLI first"
                 )));
             }
         }
@@ -240,8 +247,20 @@ impl DependencyPaths {
     }
 }
 
-/// Absolute path into the sibling ZephyraUI checkout. Relative paths break when the
-/// generated project is moved, so they are deliberately not used.
+/// Absolute path into the sibling ZephyraCore checkout (core + compiler stack).
+/// Kept separate from `crate_dep` (the main repo) so the two sources can never drift.
+fn core_dep(rel: &str) -> String {
+    let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let upstream = here
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(here)
+        .join("ZephyraCore");
+    upstream.join(rel).to_string_lossy().replace('\\', "/")
+}
+
+/// Absolute path into the sibling ZephyraUI checkout (render backends + fx).
+/// Relative paths break when the generated project is moved, so they are deliberately not used.
 fn crate_dep(rel: &str) -> String {
     let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let upstream = here

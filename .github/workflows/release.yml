@@ -27,11 +27,6 @@ jobs:
           path: ZephyraCLI
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Checkout ZephyraUI (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: Aura-Zephyrus/ZephyraUI
-          path: ZephyraUI
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -67,18 +62,12 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
-      # 两个仓并排 checkout：../../ZephyraUI 是本仓 zstylec / zypuic 的路径依赖。
       - name: Checkout ZephyraCLI
         uses: actions/checkout@v4
         with:
           path: ZephyraCLI
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Checkout ZephyraUI (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: Aura-Zephyrus/ZephyraUI
-          path: ZephyraUI
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

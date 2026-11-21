@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-# 命令行工具仓。编译库（zstylec / zypuic 的 lib 部分）留在 ZephyraUI 主仓：
-# gallery 的 build.rs 直接引用它们，所以主仓不依赖本仓 —— 依赖严格单向（本仓 → 主仓）。
+# 命令行工具仓。编译库住在独立仓 ZephyraCore，本仓通过 zstylec / zypuic
+# 以 git 依赖引用；不依赖 ZephyraUI 主仓，依赖严格单向（本仓 → ZephyraCore）。
 members = [
     "zephyra-cli",
     "zstylec",
     "zypuic",
     "zanim",
 ]
+

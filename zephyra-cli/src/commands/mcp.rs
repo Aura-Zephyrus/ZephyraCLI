@@ -2984,28 +2984,25 @@ mod tests {
         assert!(r.contains("ZEPHYRA_DEBUG_PORT"), "错误要直接指出修法：{r}");
     }
 
-    /// 协议常量对齐：CLI 的默认端口必须与库层桥一致。
+    /// 协议常量契约：CLI 的默认端口必须与框架侧桥一致。
     ///
-    /// 用 dev-dependency 直接引用框架常量，而不是硬编码 7878 —— 这样任一侧
-    /// 改动都会让这条测试变红，是真正的跨仓门禁。运行时仍不依赖 zephyra-fx。
+    /// CLI 刻意不依赖 `zephyra-fx`（连 dev-dependency 也不留），两侧各写
+    /// 一份字面量，靠这条测试钉住契约值。改这里等于改跨仓协议，需同步框架侧。
     #[test]
     fn default_port_matches_bridge() {
-        assert_eq!(zephyra_bridge_port(), zephyra_fx::DEFAULT_PORT);
+        assert_eq!(zephyra_bridge_port(), 7878);
     }
 
-    /// 连入 MCP 的环境变量名必须与框架侧一致。
-    ///
-    /// CLI 注入 `MCP_PORT_ENV`，应用侧 `zephyra-fx` 读同一个名字；两侧各写
-    /// 一份字面量，靠这条测试钉住（dev-dependency 不进入运行时依赖）。
+    /// 连入 MCP 的环境变量名必须与框架侧一致（字面量契约）。
     #[test]
     fn mcp_port_env_matches_bridge() {
-        assert_eq!(crate::commands::MCP_PORT_ENV, zephyra_fx::MCP_PORT_ENV);
+        assert_eq!(crate::commands::MCP_PORT_ENV, "ZEPHYRA_MCP_PORT");
     }
 
-    /// CDP 式拓扑用工的环境变量名也必须与框架侧一致。
+    /// CDP 式拓扑用工的环境变量名也必须与框架侧一致（字面量契约）。
     #[test]
     fn bridge_port_env_matches_bridge() {
-        assert_eq!(crate::commands::BRIDGE_PORT_ENV, zephyra_fx::PORT_ENV);
+        assert_eq!(crate::commands::BRIDGE_PORT_ENV, "ZEPHYRA_DEBUG_PORT");
     }
 
     /// CDP 式端口规划：基址 + id；老应用（无 id）仍用基址。

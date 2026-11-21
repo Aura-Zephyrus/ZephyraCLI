@@ -158,6 +158,10 @@ pub const COMMANDS: &[Command] = &[
             ArgSpec::flag("no-agent", "skip project-level MCP config and skill"),
             ArgSpec::flag("git", "run git init in the new project"),
             ArgSpec::flag("check", "run cargo check on the generated project"),
+            ArgSpec::flag(
+                "no-default-features",
+                "with --check: skip render backends, verify core/compiler only",
+            ),
         ],
         run: new::run,
     },

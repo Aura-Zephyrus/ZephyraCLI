@@ -33,7 +33,10 @@ grep -q 'zephyra://skill' "$OUT" || fail 'resources/list is missing the skill re
 # 生成工程 + 校验：模板、脚本和 CLI 共用的那条路径。
 DIR="$WORK/project"
 mkdir -p "$DIR"
-"$BIN" new smoke --path "$DIR" --no-agent --check >/dev/null
+# --check 验证生成工程能编译；--no-default-features 跳过渲染后端（后端归主仓，
+# 其编译状态由主仓负责），只验证 core/style/compiler 依赖链。
+# cargo 由 CLI 自身通过 cargo_path() 定位，绕开 Git Bash PATH 缺 cargo 的问题。
+"$BIN" new smoke --path "$DIR" --no-agent --check --no-default-features >/dev/null
 [ -f "$DIR/smoke/Cargo.toml" ] || fail 'scaffold did not write Cargo.toml'
 [ -f "$DIR/smoke/frontend/app.zstyle" ] || fail 'scaffold did not write the stylesheet'
 
