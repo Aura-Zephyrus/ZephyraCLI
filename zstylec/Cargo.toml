@@ -11,4 +11,4 @@ name = "zstylec"
 path = "src/main.rs"
 
 [dependencies]
-zstyle-compile = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.1.0" }
+zstyle-compile = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.2.0" }

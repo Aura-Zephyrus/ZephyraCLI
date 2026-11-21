@@ -15,15 +15,14 @@ vulkan = ["dep:zephyra-vulkan"]
 # `zephyra build --sf` 会传这个 feature：样式表内嵌进 exe
 sf = []
 
+# 所有 Zephyra 库（core / 编译器栈 / fx / 三后端）统一来自独立仓 ZephyraCore。
+# 不需要任何本地 checkout —— 同一来源，不会因 path/git 混用而在 lockfile 冲突。
 [dependencies]
-# core / 编译器栈来自独立仓 ZephyraCore（git），与主仓后端共享同一份 core，
-# 绝不能混用 path 与 git 两个源——否则同名 crate 在 lockfile 里冲突。
-zephyra-core = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.1.0" }
-zephyra-style = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.1.0" }
-zstyle-compile = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.1.0" }
-# 渲染后端与主仓桥仍来自 ZephyraUI 本地 checkout。
-zephyra-fx = { path = "{{DEP_FX}}" }
+zephyra-core = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.2.0" }
+zephyra-style = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.2.0" }
+zstyle-compile = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.2.0" }
+zephyra-fx = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.2.0" }
 winit = "0.30"
-zephyra-winit-d3d12 = { path = "{{DEP_D3D12}}", optional = true }
-zephyra-winit = { path = "{{DEP_D3D11}}", optional = true }
-zephyra-vulkan = { path = "{{DEP_VULKAN}}", optional = true }
+zephyra-winit-d3d12 = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.2.0", optional = true }
+zephyra-winit = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.2.0", optional = true }
+zephyra-vulkan = { git = "https://github.com/Aura-Zephyrus/ZephyraCore.git", tag = "v0.2.0", optional = true }

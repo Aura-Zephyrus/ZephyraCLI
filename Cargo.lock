@@ -443,7 +443,7 @@ version = "0.1.0"
 [[package]]
 name = "zephyra-bezier"
 version = "0.1.0"
-source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.1.0#2e461493d698749afeda4e668b9d657dcd1a5c0c"
+source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.2.0#587ef1c07172d498a8f0d958acc403b45dcf2f8b"
 
 [[package]]
 name = "zephyra-cli"
@@ -459,7 +459,7 @@ dependencies = [
 [[package]]
 name = "zephyra-core"
 version = "0.1.0"
-source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.1.0#2e461493d698749afeda4e668b9d657dcd1a5c0c"
+source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.2.0#587ef1c07172d498a8f0d958acc403b45dcf2f8b"
 dependencies = [
  "zephyra-vector",
 ]
@@ -467,7 +467,7 @@ dependencies = [
 [[package]]
 name = "zephyra-style"
 version = "0.1.0"
-source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.1.0#2e461493d698749afeda4e668b9d657dcd1a5c0c"
+source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.2.0#587ef1c07172d498a8f0d958acc403b45dcf2f8b"
 dependencies = [
  "zephyra-bezier",
  "zephyra-core",
@@ -476,7 +476,7 @@ dependencies = [
 [[package]]
 name = "zephyra-vector"
 version = "0.1.0"
-source = "git+https://github.com/Aura-Zephyrus/zephyra-vector.git?branch=main#377ae864fbfe9d30a3475aaf3b73162783011b57"
+source = "git+https://github.com/Aura-Zephyrus/zephyra-vector.git?branch=main#99eee6c19462da94deabbe46410a7daf54193ffa"
 dependencies = [
  "ab_glyph",
  "bytemuck",
@@ -502,7 +502,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "zstyle-compile"
 version = "0.1.0"
-source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.1.0#2e461493d698749afeda4e668b9d657dcd1a5c0c"
+source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.2.0#587ef1c07172d498a8f0d958acc403b45dcf2f8b"
 dependencies = [
  "cssparser",
  "zephyra-core",
@@ -519,7 +519,7 @@ dependencies = [
 [[package]]
 name = "zypui"
 version = "0.1.0"
-source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.1.0#2e461493d698749afeda4e668b9d657dcd1a5c0c"
+source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.2.0#587ef1c07172d498a8f0d958acc403b45dcf2f8b"
 dependencies = [
  "zephyra-core",
 ]
@@ -527,7 +527,7 @@ dependencies = [
 [[package]]
 name = "zypui-compile"
 version = "0.1.0"
-source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.1.0#2e461493d698749afeda4e668b9d657dcd1a5c0c"
+source = "git+https://github.com/Aura-Zephyrus/ZephyraCore.git?tag=v0.2.0#587ef1c07172d498a8f0d958acc403b45dcf2f8b"
 dependencies = [
  "zephyra-core",
  "zypui",

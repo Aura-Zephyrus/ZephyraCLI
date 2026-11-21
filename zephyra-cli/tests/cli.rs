@@ -559,15 +559,14 @@ fn cli_resolves_app_config_from_manifest_directory() {
 
     std::fs::remove_dir_all(root).unwrap();
 }
-/// 脚手架生成的 `Cargo.toml` 里，**每个**依赖都必须指向真实存在的本地包。
+/// 脚手架生成的 `Cargo.toml` 里，每个 Zephyra 依赖都必须来自 ZephyraCore 的
+/// 同一个 git tag —— 不允许本地 path 依赖，也不允许混用不同来源。
 ///
-/// 实测踩过两轮：模板先写了个根本不存在的 `zephyra` 包（真实名字是 `zephyra-ui`），
-/// 后来又写成 `../../ZephyraUI/...` 这种猜出来的相对路径 —— 工程挪个位置就指错。
-/// 两次的失败信息都只是「找不到依赖」，与真正的原因之间没有任何提示关联。
-///
-/// 这条门禁读模板、把路径解析到磁盘上、对一遍目录里有没有 `Cargo.toml`。
+/// 实测踩过的坑：模板写 `../../ZephyraUI/...` 这种相对路径，工程挪个位置就指错；
+/// 或者 core 用 git、后端用 path，同一个 crate 两个源在 lockfile 里直接冲突。
+/// 现在所有 Zephyra 库统一从 ZephyraCore tag 获取，开箱即用、无本地 checkout。
 #[test]
-fn scaffold_dependencies_all_resolve_to_real_packages() {
+fn scaffold_dependencies_all_come_from_zephyra_core() {
     let dir = std::env::temp_dir().join("zephyra-cli-dep-probe");
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -590,29 +589,29 @@ fn scaffold_dependencies_all_resolve_to_real_packages() {
     }
 
     let manifest = std::fs::read_to_string(dir.join("app").join("Cargo.toml")).unwrap();
-    let mut saw_any = false;
+    let mut zephyra_deps = 0;
     for line in manifest.lines() {
-        // `path = "X" optional = true` —— 取**引号里**那段，别把尾巴一起吃进来。
-        let Some(after) = line.split("path = ").nth(1) else {
+        let line = line.trim();
+        if line.starts_with('#') || !line.contains('=') {
             continue;
-        };
-        let quoted = after
-            .split('"')
-            .nth(1)
-            .unwrap_or_else(|| panic!("`path =` in the manifest is not quoted: {line}"));
-        saw_any = true;
-        let p = quoted;
-        let manifest_path = std::path::Path::new(p).join("Cargo.toml");
+        }
+        let name = line.split('=').next().unwrap().trim();
+        if !name.starts_with("zephyra-") && name != "zstyle-compile" && name != "zypui-compile" {
+            continue;
+        }
+        zephyra_deps += 1;
         assert!(
-            manifest_path.exists(),
-            "scaffold points at a path that does not exist: {p}\n  \
-             (the package behind it is missing, so `cargo check` fails with \
-             `no matching package` -- which says nothing about the real cause)"
+            line.contains("Aura-Zephyrus/ZephyraCore.git") && line.contains("tag = "),
+            "Zephyra dependency must come from a pinned ZephyraCore git tag: {line}"
+        );
+        assert!(
+            !line.contains("path = "),
+            "Zephyra dependency must not be a local path (breaks when the project moves): {line}"
         );
     }
     assert!(
-        saw_any,
-        "no path dependencies found -- the template lost them?"
+        zephyra_deps >= 6,
+        "scaffold lost its Zephyra dependencies (found only {zephyra_deps})"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
