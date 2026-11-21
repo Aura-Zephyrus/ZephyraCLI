@@ -1,0 +1,180 @@
+name: Pre-release
+
+# 预发布编译：在 develop/next 分支或手动触发时，构建与正式发版相同的四个目标，
+# 并以 v<version>-pre.<short-sha> 发布为 GitHub Pre-release。
+# 产物名与 install.sh / install.ps1 的映射保持一致。
+
+on:
+  push:
+    branches: [develop, next, 'pre-*']
+  workflow_dispatch:
+    inputs:
+      suffix:
+        description: 'Pre-release suffix (default: short commit sha)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: gate (fmt / clippy / test / MCP smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ZephyraCLI
+        uses: actions/checkout@v4
+        with:
+          path: ZephyraCLI
+
+      - name: Checkout ZephyraUI (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: Aura-Zephyrus/ZephyraUI
+          path: ZephyraUI
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ZephyraCLI
+
+      - name: fmt / clippy / test
+        working-directory: ZephyraCLI
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --all-targets
+
+      - name: Build release + MCP smoke
+        working-directory: ZephyraCLI
+        run: |
+          cargo build --release --locked -p zephyra-cli
+          bash scripts/smoke-mcp.sh ./target/release/zephyra
+
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.out.outputs.version }}
+      tag: ${{ steps.out.outputs.tag }}
+    steps:
+      - name: Checkout ZephyraCLI
+        uses: actions/checkout@v4
+        with:
+          path: ZephyraCLI
+
+      - name: Compute pre-release version
+        id: out
+        working-directory: ZephyraCLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=$(grep -m1 '^version' zephyra-cli/Cargo.toml | cut -d'"' -f2)
+          SUFFIX="${{ github.event.inputs.suffix }}"
+          if [ -z "$SUFFIX" ]; then
+            SUFFIX=$(git rev-parse --short HEAD)
+          fi
+          VERSION="${BASE}-pre.${SUFFIX}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [verify, version]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - name: Checkout ZephyraCLI
+        uses: actions/checkout@v4
+        with:
+          path: ZephyraCLI
+
+      - name: Checkout ZephyraUI (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: Aura-Zephyrus/ZephyraUI
+          path: ZephyraUI
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ZephyraCLI
+          key: ${{ matrix.target }}
+
+      - name: Build and package
+        shell: bash
+        working-directory: ZephyraCLI
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="zephyra-${VERSION}-${TARGET}"
+          EXE=""
+          case "$TARGET" in
+            *-windows-*) EXE=".exe" ;;
+          esac
+
+          cargo build --release --locked -p zephyra-cli --target "$TARGET"
+
+          STAGE="dist/${NAME}"
+          mkdir -p "$STAGE"
+          cp "target/${TARGET}/release/zephyra${EXE}" "$STAGE/"
+          cp "target/${TARGET}/release/cargo-zephyra${EXE}" "$STAGE/"
+          cp -R skills "$STAGE/"
+
+          tar -czf "dist/${NAME}.tar.gz" -C dist "$NAME"
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+
+          echo "Prepared dist/${NAME}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-${{ matrix.target }}
+          path: ZephyraCLI/dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish pre-release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create pre-release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          prerelease: true
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true
