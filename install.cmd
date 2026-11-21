@@ -4,6 +4,8 @@ rem Usage:  install.cmd                   install latest
 rem         install.cmd -Version v0.1.0   install a specific version
 rem         install.cmd -Uninstall        uninstall
 rem         install.cmd -NoPath           do not modify PATH
+rem         install.cmd -NoMcp            binaries only, do not wire up the agent
+rem         (by default: also installs zephyra-mcp.exe, OpenCode MCP config and the skill)
 setlocal EnableExtensions
 
 set "URL=https://raw.githubusercontent.com/Aura-Zephyrus/ZephyraCLI/main/install.ps1"

@@ -158,10 +158,11 @@ frame_index elapsed_ms total_us update_layout_us render_submit_us
 ## `screenshot`
 
 ```text
-screenshot written to C:\Users\Levy\AppData\Local\Temp\zephyra-shot-24060.bmp (3360054 bytes, 24bpp BMP)
+screenshot written to C:\Users\Levy\AppData\Local\Temp\zephyra-shot-24060.png (524331 bytes, PNG)
 ```
 
-路径是**绝对路径**。省略 `path` 时落在系统临时目录，文件名含进程 id。
+路径是**绝对路径**。省略 `path` 时落在系统临时目录，文件名含进程 id，默认导出无损 PNG。
+显式传 `.bmp` 路径时回执里的格式会显示 `24bpp BMP`；报的字节数是**落盘后**的大小。
 
 ## 输入类工具的回执
 

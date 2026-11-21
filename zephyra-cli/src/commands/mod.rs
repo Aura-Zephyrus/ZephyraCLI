@@ -22,19 +22,22 @@
 use crate::args::{ArgKind, ArgSpec, Args};
 use crate::ExitCode;
 
-/// 应用连入 MCP 的端口环境变量。由 CLI 在启动应用时注入；应用侧
-/// `zephyra_fx::bridge::MCP_PORT_ENV` 读同一个名字（测试钉住一致性）。
+/// 应用连入 MCP 的端口环境变量（旧拓扑保留兼容）。
 pub const MCP_PORT_ENV: &str = "ZEPHYRA_MCP_PORT";
+/// CDP 式拓扑：应用桥监听的**基址**环境变量。每个窗口监听 `基址 + WindowKey`；
+/// MCP 进程连出来，多个 agent 窗口各起一个 MCP 也不会抢端口。
+pub const BRIDGE_PORT_ENV: &str = "ZEPHYRA_DEBUG_PORT";
 /// dev 把资源目录交给应用的变量名。应用侧 `zephyra_fx::dev_reload` 读取；
 /// release 构建里没有任何代码读它（热重载模块被 cfg 剔除）。
 pub const DEV_ASSETS_ENV: &str = "ZEPHYRA_DEV_ASSETS";
 /// 默认监听端口，与 `zephyra_bridge_port()` / MCP 默认端口一致。
 pub const DEFAULT_MCP_PORT: u16 = 7878;
 
-/// CLI 进程自己的 `ZEPHYRA_MCP_PORT`（没有就用默认值），转发给应用子进程。
-/// MCP 也用同一个变量决定监听端口，所以一处设置两端自动对齐。
-pub(crate) fn mcp_port_for_child() -> String {
-    std::env::var(MCP_PORT_ENV).unwrap_or_else(|_| DEFAULT_MCP_PORT.to_string())
+/// 转发给应用子进程的桥端口基址。MCP 进程从同一个变量读基址，于是两端对齐。
+pub(crate) fn bridge_port_for_child() -> String {
+    std::env::var(BRIDGE_PORT_ENV)
+        .or_else(|_| std::env::var(MCP_PORT_ENV))
+        .unwrap_or_else(|_| DEFAULT_MCP_PORT.to_string())
 }
 
 pub struct Command {
@@ -139,14 +142,34 @@ impl CliError {
 
 pub const COMMANDS: &[Command] = &[
     Command {
+        name: "ai",
+        about: "print a machine-readable command manifest for agents",
+        args: "[command]",
+        options: &[],
+        run: ai::run,
+    },
+    Command {
         name: "new",
         about: "scaffold a new ZephyraUI project",
         args: "<name>",
         options: &[
             ArgSpec::value("path", "dir", "create the project in this directory"),
             ArgSpec::flag("force", "overwrite the target directory if it exists"),
+            ArgSpec::flag("no-agent", "skip project-level MCP config and skill"),
+            ArgSpec::flag("git", "run git init in the new project"),
+            ArgSpec::flag("check", "run cargo check on the generated project"),
         ],
         run: new::run,
+    },
+    Command {
+        name: "init",
+        about: "add project-level MCP config, skill and .gitignore to an existing directory",
+        args: "[dir]",
+        options: &[
+            ArgSpec::flag("no-agent", "skip MCP config and skill"),
+            ArgSpec::flag("git", "run git init if the directory is not a repo"),
+        ],
+        run: init::run,
     },
     Command {
         name: "check",
@@ -211,11 +234,17 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "mcp",
-        about: "MCP server bound to the agent (stdio); the app connects in",
+        about: "MCP server (stdio or Streamable HTTP); connects out to the app's debug bridge",
         args: "",
         options: &[
-            ArgSpec::value("port", "n", "port MCP listens on for the app to connect to"),
-            ArgSpec::value("host", "addr", "address MCP listens on for app connections"),
+            ArgSpec::value(
+                "port",
+                "n",
+                "base port of the app's debug bridge (default 7878)",
+            ),
+            ArgSpec::value("host", "addr", "host of the app's debug bridge"),
+            ArgSpec::flag("http", "serve Streamable HTTP instead of stdio"),
+            ArgSpec::value("http-port", "n", "HTTP listen port (default 8931)"),
         ],
         run: mcp::run,
     },
@@ -367,6 +396,7 @@ fn push_exit_codes(s: &mut String) {
     s.push_str("    3  environment is missing (no cargo, directory already exists)\n");
 }
 
+mod ai;
 mod bridge;
 mod build;
 mod check;
@@ -374,6 +404,7 @@ mod debug;
 mod dev;
 mod fmt;
 mod info;
+mod init;
 mod mcp;
 mod new;
 mod perf;
@@ -473,8 +504,10 @@ pub fn spawn_inherit<S: AsRef<std::ffi::OsStr>>(
         if let Some(path) = config_path {
             command.env("ZEPHYRA_APP_CONFIG_PATH", path);
         }
-        // 告诉应用 MCP 在哪：应用启动后主动连入，agent 只经 stdio 与 MCP 说话。
-        command.env(MCP_PORT_ENV, mcp_port_for_child());
+        // 应用监听这个基址（每窗口 +id）；MCP 进程会连出来。
+        command.env(BRIDGE_PORT_ENV, bridge_port_for_child());
+        // 旧拓扑的残留变量不能留着，否则应用还会尝试连一个不存在的 MCP 监听端口。
+        command.env_remove(MCP_PORT_ENV);
         let status = command
             .status()
             .map_err(|e| CliError::missing(format!("cannot run {}: {e}", program.display())))?;
@@ -558,8 +591,9 @@ pub fn spawn_pumped<S: AsRef<std::ffi::OsStr>>(
     if let Some(path) = config_path {
         command.env("ZEPHYRA_APP_CONFIG_PATH", path);
     }
-    // 告诉应用 MCP 在哪：应用启动后主动连入，agent 只经 stdio 与 MCP 说话。
-    command.env(MCP_PORT_ENV, mcp_port_for_child());
+    // 应用监听这个基址（每窗口 +id）；MCP 进程会连出来。
+    command.env(BRIDGE_PORT_ENV, bridge_port_for_child());
+    command.env_remove(MCP_PORT_ENV);
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
     let mut child = command

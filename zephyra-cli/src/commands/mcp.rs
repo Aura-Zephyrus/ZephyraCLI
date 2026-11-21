@@ -30,24 +30,34 @@
 //! # 并发模型：协议消息即时答，工具调用排队做
 //!
 //! stdin 线程只处理**不碰桥**的消息（`initialize` / `tools/list` / `ping` /
-//! 通知）；`tools/call` 连同原始行投给唯一的工具工作线程，后者持有桥连接、
-//! 按到达顺序执行。这样做的理由：`analyze_performance` 最长 300 秒、
-//! `pointer_drag` 最长 60 秒——单线程版在这些调用期间对任何消息都不应答，
-//! 而 MCP host 的默认工具超时往往只有 60 秒，超时后整个 server 看起来死了。
+//! 通知）；`tools/call` 连同原始行投给唯一的工具工作线程，后者按到达顺序执行。
+//! 这样做的理由：`analyze_performance` 最长 300 秒、`pointer_drag` 最长 60
+//! 秒——单线程版在这些调用期间对任何消息都不应答，而 MCP host 的默认工具超时
+//! 往往只有 60 秒，超时后整个 server 看起来死了。
+//!
+//! # 多窗口：按窗口 id 路由
+//!
+//! `WindowSet` 应用里每个窗口各有一条桥连入本 server，`hello` 帧的第三段是
+//! 它的 `WindowKey`。工作线程用 `HashMap<window_id, BridgeClient>` 同时持有它们，
+//! 不再「后连的覆盖先连的」。工具调用用可选 `window_id` 指定目标：`list_windows`
+//! 用来发现 id；只连着一个窗口时可省略，连着多个却没指定则报错，绝不猜。
 //!
 //! 取消（`notifications/cancelled`）由跨线程共享的登记表传递：排队中的调用
 //! 在开跑前查表跳过；在途的 `analyze_performance` 在每轮轮询间隙查表中止。
 //! 按协议，被取消的请求**不回**。
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::{CliError, Write};
-use crate::bridge_client::{BridgeClient, BridgeResponse};
+use crate::bridge_client::{AppHello, BridgeClient, BridgeResponse};
 use crate::{args::Args, ExitCode};
 
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 一个 MCP 工具的定义（`tools/list` 的数据源 + `tools/call` 的执行）。
@@ -67,7 +77,13 @@ struct Tool {
 /// 消息形状（tools / ping / 取消 / 通知）在这些 revision 之间没有差别，所以全部
 /// 声明支持：客户端要哪个就回哪个；不认识的版本回我们最新的 —— 按 MCP 规范，
 /// 这就是让客户端自行决定继续还是断开的降级信号。
-const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const PROTOCOL_VERSIONS: &[&str] = &[
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
 
 /// `initialize` 的 `instructions`：OpenCode / Claude 等客户端会把它注入系统
 /// 提示。有了它，模型不必从十几个工具名里猜「先读再操作再读」的工作流。
@@ -76,7 +92,49 @@ use get_layout for textual layout/context and get_tree for ABSOLUTE pixel coordi
 use get_props for one node's full properties; use screenshot only when visual pixels matter. \
 Input tools (click/hover/press_key/scroll/pointer_drag) take effect on the current frame, so \
 follow them with get_layout or wait_frames before concluding. Tools need the app launched by \
-`zephyra dev` so it connects into this MCP server; initialize and tools/list work before that.";
+`zephyra dev` listening on ZEPHYRA_DEBUG_PORT, which this MCP server connects out to; \
+initialize and tools/list work before that. \
+When several windows are connected, call list_windows to get their ids and pass window_id to \
+every tool; omitting it is only allowed when exactly one window is connected. A detailed skill \
+named `zephyra-mcp` is installed in the agent (load it with the skill tool) — read it before \
+complex debugging sessions for the full workflow, capability limits and troubleshooting.";
+
+/// MCP resources：把给 AI 的技能文档通过协议暴露，不依赖客户端是否扫描
+/// 本地 skills 目录。内容编译期嵌入，与工具描述同源。
+const SKILL_MD: &str = include_str!("../../../skills/zephyra-mcp/SKILL.md");
+const SKILL_TOOLS_MD: &str = include_str!("../../../skills/zephyra-mcp/references/tools.md");
+const SKILL_OUTPUT_MD: &str =
+    include_str!("../../../skills/zephyra-mcp/references/output-formats.md");
+const SKILL_TROUBLESHOOTING_MD: &str =
+    include_str!("../../../skills/zephyra-mcp/references/troubleshooting.md");
+
+/// (uri, name, description, text)
+const RESOURCES: &[(&str, &str, &str, &str)] = &[
+    (
+        "zephyra://skill",
+        "ZephyraUI MCP skill",
+        "Full workflow, capability limits and troubleshooting for driving ZephyraUI via MCP",
+        SKILL_MD,
+    ),
+    (
+        "zephyra://skill/tools",
+        "Tool reference",
+        "Parameters and semantics of every zephyra tool",
+        SKILL_TOOLS_MD,
+    ),
+    (
+        "zephyra://skill/output-formats",
+        "Output formats",
+        "Exact text shapes returned by each tool",
+        SKILL_OUTPUT_MD,
+    ),
+    (
+        "zephyra://skill/troubleshooting",
+        "Troubleshooting",
+        "Symptom → cause → fix for MCP connection and UI driving problems",
+        SKILL_TROUBLESHOOTING_MD,
+    ),
+];
 
 /// 按客户端请求选协议版本；见 [`PROTOCOL_VERSIONS`]。
 fn negotiated_version(requested: Option<&str>) -> &'static str {
@@ -101,7 +159,41 @@ const READ_ONLY: &str = r#"{"readOnlyHint": true, "destructiveHint": false}"#;
 /// 输入/采集类工具：会改变界面状态或进程内采样状态，但不销毁数据。
 const MUTATES: &str = r#"{"readOnlyHint": false, "destructiveHint": false}"#;
 
+/// `list_windows` 不碰桥，因此不接受 `window_id`；其余工具都接受（在 `tools/list`
+/// 里统一注入该参数，省得每个 schema 字面量都抄一遍）。
+const NO_WINDOW_TOOLS: &[&str] = &["list_windows"];
+
+/// 这些工具的返回同时带 `structuredContent`：agent 不必从自然语言里抠字段。
+/// 文本 `content` 仍然保留，兼容不看结构化结果的客户端。
+const STRUCTURED_SCHEMAS: &[(&str, &str)] = &[
+    (
+        "list_windows",
+        r#"{"type":"object","properties":{"windows":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"label":{"type":"string"},"identity":{"type":"string"},"status":{"type":"string"}},"required":["id","label","identity","status"]}},"currentTargetId":{"type":["integer","null"]}},"required":["windows"]}"#,
+    ),
+    (
+        "get_viewport",
+        r#"{"type":"object","properties":{"width":{"type":"number"},"height":{"type":"number"},"unit":{"const":"physical-pixels"}},"required":["width","height","unit"]}"#,
+    ),
+    (
+        "get_app_info",
+        r#"{"type":"object","properties":{"label":{"type":"string"},"identity":{"type":"string"}},"required":["label","identity"]}"#,
+    ),
+    (
+        "screenshot",
+        r#"{"type":"object","properties":{"path":{"type":"string"},"bytes":{"type":"integer"},"format":{"type":"string"}},"required":["path","bytes","format"]}"#,
+    ),
+];
+
 const TOOLS: &[Tool] = &[
+    Tool {
+        name: "list_windows",
+        description: "List the ZephyraUI windows currently connected to this MCP server. \
+Returns each window's numeric id (taken from its WindowKey), its `window#N` label, app identity \
+and connection state. When a `WindowSet` app opens several windows, each one connects with its \
+own id; call this first, then pass that id as `window_id` to other tools for precise targeting.",
+        schema: r#"{"type": "object", "properties": {}}"#,
+        annotations: READ_ONLY,
+    },
     Tool {
         name: "get_app_info",
         description: "Identity the connected app reported when it linked to this MCP server \
@@ -212,8 +304,10 @@ key or when several elements share one key.",
     },
     Tool {
         name: "press_key",
-        description: "Synthesize one logical key press and release (for example Enter, \
-ArrowDown, Escape, or a character). The running View receives both key-edge events.",
+        description: "Synthesize one logical key press and release. The running View receives \
+both key-edge events. Named keys are whitelisted: Backspace, Delete, Enter, Escape, Space, Tab, \
+ArrowLeft/Right/Up/Down, Home, End, PageUp/PageDown; a single printable character also produces \
+a char event. Named keys produce edges only (no char event), and no modifier keys are supported.",
         schema: r#"{"type": "object", "properties": {"key": {"type": "string", "description": "One logical key name; spaces and control characters are not allowed"}}, "required": ["key"]}"#,
         annotations: MUTATES,
     },
@@ -299,15 +393,158 @@ few frames it managed to wait for.",
     },
     Tool {
         name: "screenshot",
-        description: "Render a frame and read back the pixels as a 24bpp BMP. D3D11 and \
-D3D12 apps support this. Returns the absolute file path that was written; use get_layout for \
-textual layout context without pixel data. By default the capture keeps the current frame's \
-damage region, so stale pixels from the previous frame (ghosting) stay visible; pass \
-repaint=true for a clean full-frame image.",
-        schema: r#"{"type": "object", "properties": {"path": {"type": "string", "description": "where to write the .bmp; defaults to a temp file"}, "repaint": {"type": "boolean", "default": false, "description": "force a full-frame repaint instead of keeping the current damage region"}}}"#,
+        description: "Render a frame and read back the pixels, saved as PNG by default (lossless). \
+D3D11, D3D12 and Vulkan apps support this. Returns the absolute file path that was written; use \
+get_layout for textual layout context without pixel data. Pass a .bmp path to keep the raw \
+24bpp BMP for pixel-exact diagnosis. By default the capture keeps the current frame's damage \
+region, so stale pixels from the previous frame (ghosting) stay visible; pass repaint=true for \
+a clean full-frame image. Pass inline=true to also receive the PNG as base64 image content.",
+        schema: r#"{"type": "object", "properties": {"path": {"type": "string", "description": "output path; defaults to a temp .png file. A .bmp path keeps the raw 24bpp BMP"}, "repaint": {"type": "boolean", "default": false, "description": "force a full-frame repaint instead of keeping the current damage region"}, "inline": {"type": "boolean", "default": false, "description": "also return the PNG as base64 image content (off by default to save context)"}}}"#,
         annotations: MUTATES,
     },
 ];
+
+/// 启动应用端点发现线程；stdio 与 HTTP 两种传输共用。
+fn spawn_connector(
+    host: &str,
+    port: u16,
+    live: Arc<Mutex<HashSet<u64>>>,
+) -> Result<mpsc::Receiver<(BridgeClient, Option<AppHello>)>, CliError> {
+    let (app_tx, app_rx) = mpsc::channel::<(BridgeClient, Option<AppHello>)>();
+    let connector_host = host.to_string();
+    std::thread::Builder::new()
+        .name("zephyra-mcp-app-connect".into())
+        .spawn(move || loop {
+            for offset in 0..WINDOW_PROBE_LIMIT {
+                let Some(probe_port) = port.checked_add(offset) else {
+                    break;
+                };
+                let Ok(mut addrs) = (connector_host.as_str(), probe_port).to_socket_addrs() else {
+                    continue;
+                };
+                let Some(addr) = addrs.next() else { continue };
+                let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(150))
+                else {
+                    continue;
+                };
+                let mut client = BridgeClient::from_stream(stream);
+                let Some(hello) = client.identify() else {
+                    continue;
+                };
+                let id = hello.window_id.unwrap_or(LEGACY_WINDOW_ID);
+                {
+                    let mut live = live.lock().unwrap();
+                    if live.contains(&id) {
+                        continue;
+                    }
+                    live.insert(id);
+                }
+                eprintln!(
+                    "[zephyra-mcp] {} connected: {}",
+                    window_label(id),
+                    hello.identity
+                );
+                if app_tx.send((client, Some(hello))).is_err() {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        })
+        .map_err(|e| CliError::failure(format!("cannot start app connector: {e}")))?;
+    Ok(app_rx)
+}
+
+/// 读一条 HTTP 请求（只实现 Streamable HTTP 需要的 POST + Content-Length）。
+fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
+    use std::io::{BufRead, BufReader, Read};
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).ok()?;
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            content_length = value.trim().parse().ok()?;
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body).ok()?;
+    Some((
+        request_line.trim_end().to_string(),
+        String::from_utf8_lossy(&body).into_owned(),
+    ))
+}
+
+fn http_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nMcp-Session-Id: zephyra-1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// Streamable HTTP 传输：一个长驻 server 给多个 agent 用，避免每个目录各起进程。
+fn run_http(host: &str, bridge_port: u16, http_port: u16) -> Result<ExitCode, CliError> {
+    let listener = TcpListener::bind((host, http_port)).map_err(|e| {
+        CliError::failure(format!(
+            "cannot listen for MCP HTTP on {host}:{http_port}: {e}"
+        ))
+    })?;
+    let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+    let app_rx = spawn_connector(host, bridge_port, live.clone())?;
+    let session = Arc::new(Mutex::new(Session::outbound(
+        host,
+        bridge_port,
+        Cancelled::default(),
+        live,
+    )));
+
+    // 发现线程送来的窗口连接由这里挂进共享 session。
+    let attach_session = session.clone();
+    std::thread::Builder::new()
+        .name("zephyra-mcp-http-attach".into())
+        .spawn(move || loop {
+            while let Ok((client, hello)) = app_rx.try_recv() {
+                let id = hello
+                    .as_ref()
+                    .and_then(|h| h.window_id)
+                    .unwrap_or(LEGACY_WINDOW_ID);
+                let identity = hello.map(|h| h.identity);
+                attach_session.lock().unwrap().attach(id, client, identity);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        })
+        .map_err(|e| CliError::failure(format!("cannot start HTTP attach thread: {e}")))?;
+
+    eprintln!("[zephyra-mcp] HTTP transport ready on http://{host}:{http_port}/mcp");
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let request_session = session.clone();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let Some((request_line, body)) = read_http_request(&mut stream) else {
+                return;
+            };
+            let is_post = request_line.starts_with("POST ");
+            let mut guard = request_session.lock().unwrap();
+            let response = if !is_post || body.trim().is_empty() {
+                http_response("202 Accepted", "")
+            } else {
+                match handle_message(&body, &mut guard) {
+                    Some(reply) => http_response("200 OK", &reply),
+                    None => http_response("202 Accepted", ""),
+                }
+            };
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+    }
+    Ok(ExitCode::Success)
+}
 
 pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
     let port: u16 = args
@@ -318,51 +555,44 @@ pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
         .unwrap_or_else(default_mcp_port);
     let host = args.option("host").unwrap_or("127.0.0.1").to_string();
 
-    // MCP 监听：由 `zephyra dev` / `run` 启动的应用会按 ZEPHYRA_MCP_PORT 连回来。
-    // agent 侧仍然只有 stdio 一个通道 —— MCP 与 agent 绑定、与应用分离。
-    let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| {
-        CliError::failure(format!(
-            "cannot listen for app connections on {host}:{port}: {e} \
-             （用 `zephyra mcp --port <n>` 换端口，并让 dev 的 ZEPHYRA_MCP_PORT 跟上）"
-        ))
-    })?;
-    let (app_tx, app_rx) = mpsc::channel::<(BridgeClient, Option<String>)>();
-    std::thread::Builder::new()
-        .name("zephyra-mcp-app-accept".into())
-        .spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(s) => {
-                        // 身份帧在这里读，不占工具工作线程：应用帧循环停摆时
-                        // read_hello 最坏阻塞几百 ms，MCP 期间必须继续应答工具调用。
-                        let mut client = BridgeClient::from_stream(s);
-                        let identity = client.read_hello();
-                        if app_tx.send((client, identity)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => eprintln!("[zephyra-mcp] app accept failed: {e}"),
-                }
-            }
-        })
-        .map_err(|e| CliError::failure(format!("cannot start app acceptor: {e}")))?;
+    if args.has("http") {
+        let http_port: u16 = args
+            .option("http-port")
+            .map(|p| p.parse())
+            .transpose()
+            .map_err(|_| CliError::usage("--http-port needs a number"))?
+            .unwrap_or(8931);
+        return run_http(&host, port, http_port);
+    }
+
+    // CDP 式拓扑：**应用持有端点，MCP 连出去**。每个窗口监听
+    // `ZEPHYRA_DEBUG_PORT 基址 + 窗口 id`，所以多个 agent 窗口各起一个 MCP
+    // 进程也不会抢同一个端口 —— 这是相对「MCP 监听、应用连入」的关键改动。
+    let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+    let app_rx = spawn_connector(&host, port, live.clone())?;
 
     // 取消登记表：stdin 线程写，工具工作线程读（见模块文档的并发模型）。
     let cancelled = Cancelled::default();
     let (job_tx, job_rx) = mpsc::channel::<String>();
     let worker_cancelled = cancelled.clone();
     let worker_host = host.clone();
+    let worker_live = live.clone();
     std::thread::Builder::new()
         .name("zephyra-mcp-tools".into())
         .spawn(move || {
-            // 工具线程持有唯一的桥会话——工具调用因此天然串行，AI 的
-            // 「读-改-读」次序不会被并发打乱。
-            let mut session = Session::inbound(&worker_host, port, worker_cancelled);
+            // 工具线程持有全部窗口的桥会话——工具调用因此天然串行，AI 的
+            // 「读-改-读」次序不会被并发打乱；窗口之间则按 id 分开存放。
+            let mut session = Session::outbound(&worker_host, port, worker_cancelled, worker_live);
             loop {
-                // 先收应用连入（非阻塞）；应用重启后会自动重连进来。
-                if let Ok((client, identity)) = app_rx.try_recv() {
-                    eprintln!("[zephyra-mcp] app connected");
-                    session.attach(client, identity);
+                // 先收发现线程送来的窗口连接（非阻塞）。
+                while let Ok((client, hello)) = app_rx.try_recv() {
+                    match hello {
+                        Some(hello) => {
+                            let id = hello.window_id.unwrap_or(LEGACY_WINDOW_ID);
+                            session.attach(id, client, Some(hello.identity));
+                        }
+                        None => session.attach(LEGACY_WINDOW_ID, client, None),
+                    }
                 }
                 // 再等工具调用；20ms 超时保证 app_rx 不会被饿死。
                 match job_rx.recv_timeout(Duration::from_millis(20)) {
@@ -382,10 +612,10 @@ pub fn run(args: &Args, io: &mut dyn Write) -> Result<ExitCode, CliError> {
 
     // 主线程只处理不碰桥的消息（initialize / tools/list / ping / 通知）。
     // 握手不需要应用在线——AI 客户端往往先拉起 MCP 再起应用。
-    let mut session = Session::inbound(&host, port, cancelled);
+    let mut session = Session::outbound(&host, port, cancelled, live);
 
     io.err_line(&format!(
-        "[zephyra-mcp] ready (listening for app on {host}:{port}); stdout is protocol-only"
+        "[zephyra-mcp] ready (connecting to app bridge on {host}:{port}); stdout is protocol-only"
     ));
 
     let stdin = std::io::stdin();
@@ -428,93 +658,351 @@ fn write_reply(reply: &str) {
     let _ = lock.flush();
 }
 
-/// 一个会话的桥侧状态：连接缓存 + 取消登记表。
+/// MCP `notifications/progress` 的正文；抽成纯函数便于测试形状。
+fn progress_notification(token: &Value, progress: u64, total: u64) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {"progressToken": token, "progress": progress, "total": total},
+    })
+    .to_string()
+}
+
+/// 老应用 / 单窗口兼容路径不发窗口 id，用这个键（与主仓
+/// `WindowKey::unspecified()` 同值）挂在表里，以免和真实窗口 id 撞键。
+const LEGACY_WINDOW_ID: u64 = u64::MAX;
+
+/// 发现阶段最多探测 `base..base+N` 这些端口（一个进程最多这么多窗口）。
+/// 探测是「连接被拒就跳过」，16 个端口在应用没起来时也只是一瞬间。
+const WINDOW_PROBE_LIMIT: u16 = 16;
+
+/// 给 AI 看的窗口标签。真实 id 就是 `WindowKey::as_u64()` 的数字。
+fn window_label(id: u64) -> String {
+    if id == LEGACY_WINDOW_ID {
+        "legacy-single".into()
+    } else {
+        format!("window#{id}")
+    }
+}
+
+/// 一条窗口连接的身份与流。`client: None` = 曾连过但现在断了（等应用重连）。
+struct WindowLink {
+    client: Option<BridgeClient>,
+    identity: Option<String>,
+}
+
+/// 一个会话的桥侧状态：按窗口 id 缓存的连接 + 取消登记表。
 ///
-/// 主线程与工具线程各有一个实例（主线程的 `client` 永远是 `None`——它不碰桥），
+/// 主线程与工具线程各有一个实例（主线程的 `clients` 永远是空的——它不碰桥），
 /// 但共享同一张取消表。
 ///
-/// 生产路径用 [`Self::inbound`]：应用主动连入，`client` 由 [`Self::attach`] 安放。
-/// [`Self::new`] 保留旧的「主动拨号」形态，只给测试里的替身服务器用 —— 协议
-/// 测试不该因为拓扑反转而重写一遍。
+/// 生产路径用 [`Self::outbound`]：发现线程拨号应用端点，连接由 [`Self::attach`]
+/// 安放；`live_windows` 与发现线程共享，连接失败时由 `drop_client` 摘掉 id，
+/// 下一轮扫描才会重连。`port` 是 **基址**，窗口 id 对应的端口 = 基址 + id。
+/// [`Self::new`] 保留「替身服务器」形态，只给测试用。
 struct Session {
     host: String,
+    /// 应用桥的监听**基址**（`ZEPHYRA_DEBUG_PORT`）。
     port: u16,
-    client: Option<BridgeClient>,
+    clients: HashMap<u64, WindowLink>,
+    /// 当前调用解析出的目标窗口。`ensure_client` / `drop_client` 读它，
+    /// 这样多步手势（pointer_drag）中途不用反复传 id。
+    current_target: u64,
     cancelled: Cancelled,
-    /// true = 应用连入（生产）；false = 主动拨号（测试替身）。
-    inbound: bool,
-    /// 应用连入时报的身份（`hello <app-name> <version>`）。旧应用不发 ⇒ `None`。
-    app_identity: Option<String>,
+    /// 测试替身：表为空时允许默认窗口 0，由 `ensure_client` 现场拨号。
+    lazy_dial: bool,
+    /// 已挂上的窗口 id，供发现线程跳过、避免每轮替换活连接。
+    live_windows: Arc<Mutex<HashSet<u64>>>,
+    /// 当前工具调用的 `_meta.progressToken`，用于发进度通知。
+    progress_token: Option<Value>,
 }
 
 impl Session {
-    /// 旧拓扑：客户端主动连应用到端口。**仅供测试**。
+    /// 替身服务器形态。**仅供测试**。
     #[cfg(test)]
     fn new(host: &str, port: u16, cancelled: Cancelled) -> Self {
         Self {
             host: host.to_string(),
             port,
-            client: None,
+            clients: HashMap::new(),
+            current_target: 0,
             cancelled,
-            inbound: false,
-            app_identity: None,
+            lazy_dial: true,
+            live_windows: Arc::new(Mutex::new(HashSet::new())),
+            progress_token: None,
         }
     }
 
-    /// 生产拓扑：MCP 监听、应用连入。
-    fn inbound(host: &str, port: u16, cancelled: Cancelled) -> Self {
+    /// 生产拓扑：MCP 进程主动连出到应用持有的端点。
+    fn outbound(
+        host: &str,
+        port: u16,
+        cancelled: Cancelled,
+        live_windows: Arc<Mutex<HashSet<u64>>>,
+    ) -> Self {
         Self {
             host: host.to_string(),
             port,
-            client: None,
+            clients: HashMap::new(),
+            current_target: LEGACY_WINDOW_ID,
             cancelled,
-            inbound: true,
-            app_identity: None,
+            lazy_dial: false,
+            live_windows,
+            progress_token: None,
         }
     }
 
-    /// 安放已由 accept 线程读完身份行的 client。工具线程是唯一调用者。
-    ///
-    /// 身份必须在 accept 线程里先读掉（第一帧），否则下一句命令的响应会读到它。
-    /// 当前只挂一条应用流：后连的覆盖先连的，所以覆盖时明确记一条诊断。
-    fn attach(&mut self, client: BridgeClient, identity: Option<String>) {
+    /// 目标窗口对应的端口：基址 + id；老应用（无 id）直接用基址。
+    fn port_for(&self, id: u64) -> u16 {
+        if id == LEGACY_WINDOW_ID {
+            self.port
+        } else {
+            self.port.checked_add(id as u16).unwrap_or(self.port)
+        }
+    }
+
+    /// 安放发现线程送来的 client。工具线程是唯一调用者。
+    /// 同一 id 再连（应用重启）只替换那一条，不挤掉其它窗口。
+    fn attach(&mut self, id: u64, client: BridgeClient, identity: Option<String>) {
         match &identity {
-            Some(id) => eprintln!("[zephyra-mcp] app hello: {id}"),
-            None => eprintln!("[zephyra-mcp] app connected (no hello; legacy app?)"),
+            Some(name) => eprintln!("[zephyra-mcp] {} hello: {name}", window_label(id)),
+            None => eprintln!(
+                "[zephyra-mcp] {} connected (no hello; legacy app?)",
+                window_label(id)
+            ),
         }
-        if let Some(previous) = self.app_identity.take() {
-            eprintln!("[zephyra-mcp] app stream replaced (previous hello: {previous})");
+        match self.clients.get_mut(&id) {
+            Some(link) => {
+                if let Some(previous) = link.identity.take() {
+                    eprintln!(
+                        "[zephyra-mcp] {} stream replaced (previous hello: {previous})",
+                        window_label(id)
+                    );
+                }
+                link.identity = identity;
+                link.client = Some(client);
+            }
+            None => {
+                self.clients.insert(
+                    id,
+                    WindowLink {
+                        client: Some(client),
+                        identity,
+                    },
+                );
+            }
         }
-        self.app_identity = identity;
-        self.client = Some(client);
+        if let Ok(mut live) = self.live_windows.lock() {
+            live.insert(id);
+        }
     }
 
-    /// 拿到当前应用连接。
-    ///
-    /// 生产拓扑下没有应用连入就**明确报错**，绝不回退到「拿端口去连应用」——
-    /// 那正是本次改造要去掉的路径（agent 不该知道应用的调试端口）。
-    fn ensure_client(&mut self) -> Result<&mut BridgeClient, String> {
-        if self.client.is_none() && !self.inbound {
-            let (host, port) = (self.host.clone(), self.port);
-            self.client = Some(BridgeClient::connect(&host, port, 3).map_err(|e| {
-                format!(
-                    "连不上应用调试桥 {host}:{port}（{e}）——确认应用以 ZEPHYRA_DEBUG_PORT={port} 启动"
-                )
-            })?);
+    /// 从工具参数解析目标窗口 id，并记到 `current_target` 供本轮调用使用。
+    fn resolve_target(&mut self, a: &Value) -> Result<u64, String> {
+        let id = match a.get("window_id") {
+            Some(v) => {
+                let id = v
+                    .as_u64()
+                    .ok_or_else(|| "window_id 必须是非负整数（来自 list_windows）".to_string())?;
+                self.require_connected(id)?;
+                id
+            }
+            None => self.default_window()?,
+        };
+        self.current_target = id;
+        Ok(id)
+    }
+
+    /// 没传 `window_id` 时的默认目标：只有一个在线窗口就用它；多个则报错
+    /// 让 agent 显式选择，绝不猜。测试拨号形态下表为空时允许 0（由
+    /// `ensure_client` 现场拨号）。
+    fn default_window(&self) -> Result<u64, String> {
+        if self.lazy_dial && self.clients.is_empty() {
+            return Ok(0);
         }
-        self.client.as_mut().ok_or_else(|| {
-            format!(
-                "应用尚未连入 MCP（监听 {}:{}）——用 `zephyra dev` 启动应用，\
-                 CLI 会把 ZEPHYRA_MCP_PORT={} 交给它",
+        let online: Vec<u64> = self
+            .clients
+            .iter()
+            .filter(|(_, link)| link.client.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        match online.len() {
+            0 => Err(format!(
+                "连不上应用调试桥 {}:{}——用 `zephyra dev` 启动应用，\
+                 并确认它设置了 ZEPHYRA_DEBUG_PORT={}",
                 self.host, self.port, self.port
-            )
-        })
+            )),
+            1 => Ok(online[0]),
+            _ => {
+                let list = online
+                    .iter()
+                    .map(|id| format!("{} (id={id})", window_label(*id)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!(
+                    "多个窗口已连入（{list}）；window_id 必填：先调 list_windows，再给工具传 window_id"
+                ))
+            }
+        }
+    }
+
+    /// 显式指定的 id 必须真的在线，避免对着已关闭的窗口发命令。
+    fn require_connected(&self, id: u64) -> Result<u64, String> {
+        if self
+            .clients
+            .get(&id)
+            .map(|link| link.client.is_some())
+            .unwrap_or(false)
+        {
+            Ok(id)
+        } else {
+            let online = self.online_labels();
+            Err(format!(
+                "窗口 {id} 未连接或已断开；当前在线：{online}——调 list_windows 刷新"
+            ))
+        }
+    }
+
+    fn online_labels(&self) -> String {
+        let mut ids: Vec<u64> = self
+            .clients
+            .iter()
+            .filter(|(_, link)| link.client.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        if ids.is_empty() {
+            "(none)".into()
+        } else {
+            ids.iter()
+                .map(|id| format!("{} (id={id})", window_label(*id)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
+    /// `list_windows` 的正文：按 id 排序，带身份与连接状态。
+    fn list_windows_text(&self) -> String {
+        if self.clients.is_empty() {
+            return "no window connected yet (start the app with `zephyra dev`)".into();
+        }
+        let mut ids: Vec<u64> = self.clients.keys().copied().collect();
+        ids.sort_unstable();
+        let mut lines = vec![format!("windows connected ({}):", ids.len())];
+        for id in ids {
+            let link = &self.clients[&id];
+            let status = if link.client.is_some() {
+                "connected"
+            } else {
+                "reconnecting"
+            };
+            let identity = link.identity.as_deref().unwrap_or("(no hello)");
+            lines.push(format!(
+                "  id={id}  {}  {identity}  {status}",
+                window_label(id)
+            ));
+        }
+        lines.push(format!(
+            "current target: {}",
+            window_label(self.current_target)
+        ));
+        lines.push(
+            "pass `window_id` to target a tool (required when several windows are connected)"
+                .into(),
+        );
+        lines.join("\n")
+    }
+
+    /// `list_windows` 的结构化结果：文本给人读，这个给 agent 直接取字段。
+    fn windows_structured(&self) -> Vec<Value> {
+        let mut ids: Vec<u64> = self.clients.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .map(|id| {
+                let link = &self.clients[&id];
+                json!({
+                    "id": id,
+                    "label": window_label(id),
+                    "identity": link.identity.as_deref().unwrap_or("(no hello)"),
+                    "status": if link.client.is_some() { "connected" } else { "reconnecting" },
+                })
+            })
+            .collect()
+    }
+
+    /// 当前调用带 progressToken 时发一条进度通知；没有就静默。
+    fn notify_progress(&self, progress: u64, total: u64) {
+        if let Some(token) = &self.progress_token {
+            write_reply(&progress_notification(token, progress, total));
+        }
+    }
+
+    /// 当前调用目标的身份（给 `get_app_info` 用，不碰桥）。
+    fn current_identity(&self) -> Option<&str> {
+        self.clients
+            .get(&self.current_target)
+            .and_then(|link| link.identity.as_deref())
+    }
+
+    /// 拿到当前目标窗口的连接。没有缓存连接就**现场拨号**到 `基址 + id`——
+    /// CDP 式拓扑里端口归应用所有，MCP 只是客户端，所以拨号是正常路径。
+    fn ensure_client(&mut self) -> Result<&mut BridgeClient, String> {
+        let id = self.current_target;
+        let missing = self
+            .clients
+            .get(&id)
+            .map(|link| link.client.is_none())
+            .unwrap_or(true);
+        if missing {
+            let host = self.host.clone();
+            let port = self.port_for(id);
+            let client = BridgeClient::connect(&host, port, 3).map_err(|e| {
+                format!(
+                    "连不上应用调试桥 {host}:{port}（{e}）——确认应用以 ZEPHYRA_DEBUG_PORT={} 启动",
+                    self.port
+                )
+            })?;
+            self.clients
+                .entry(id)
+                .or_insert(WindowLink {
+                    client: None,
+                    identity: None,
+                })
+                .client = Some(client);
+            if let Ok(mut live) = self.live_windows.lock() {
+                live.insert(id);
+            }
+        }
+        self.clients
+            .get_mut(&id)
+            .and_then(|link| link.client.as_mut())
+            .ok_or_else(|| {
+                format!(
+                    "窗口 {} 尚未连入 MCP（应用桥 {}:{}）——调 list_windows 查看当前在线窗口",
+                    window_label(id),
+                    self.host,
+                    self.port
+                )
+            })
     }
 
     /// 丢弃当前连接。**半读之后的流不可复用**：缓冲里可能压着半条响应，
-    /// 继续用会让后续响应切分错位；唯一正确的动作是等应用重连。
+    /// 继续用会让后续响应切分错位。同时把 id 从共享表里摘掉，让发现线程
+    /// 下一轮扫描重新连上来。
     fn drop_client(&mut self) {
-        self.client = None;
+        let id = self.current_target;
+        if let Some(link) = self.clients.get_mut(&id) {
+            link.client = None;
+        }
+        if let Ok(mut live) = self.live_windows.lock() {
+            live.remove(&id);
+        }
+    }
+
+    /// 测试断言用：当前是否缓存着任意一条在线连接。
+    #[cfg(test)]
+    fn client(&self) -> Option<&BridgeClient> {
+        self.clients.values().find_map(|link| link.client.as_ref())
     }
 }
 
@@ -541,10 +1029,11 @@ fn zephyra_bridge_port() -> u16 {
     7878
 }
 
-/// MCP 的默认监听端口。优先读 `ZEPHYRA_MCP_PORT` —— CLI 启动应用时把同一个
-/// 值交给它，所以这一处环境变量就让「MCP 监听端口」与「应用连入端口」对齐。
+/// MCP 要连的应用桥**基址**。优先读 `ZEPHYRA_DEBUG_PORT`（应用监听那个端口
+/// 及 +id 的衍生端口）；旧的 `ZEPHYRA_MCP_PORT` 也认，兼容已有配置。
 fn default_mcp_port() -> u16 {
-    std::env::var(super::MCP_PORT_ENV)
+    std::env::var(super::BRIDGE_PORT_ENV)
+        .or_else(|_| std::env::var(super::MCP_PORT_ENV))
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(zephyra_bridge_port)
@@ -585,6 +1074,19 @@ fn handle_message(line: &str, session: &mut Session) -> Option<String> {
         // MCP 的 keepalive。回空 result，不碰桥——客户端用它探测 server 活性，
         // 与「应用在不在线」无关。
         "ping" => Some(json_reply(id, json!({}))),
+        // OpenCode 的 `protocol: auto` 用 server/discover 探测 2026-07-28；
+        // 我们支持该修订，直接回报能力即可，客户端不必退回 legacy。
+        "server/discover" => Some(json_reply(
+            id,
+            json!({
+                "protocolVersion": PROTOCOL_VERSIONS[0],
+                "capabilities": {
+                    "tools": {"listChanged": false},
+                    "resources": {"subscribe": false, "listChanged": false}
+                },
+                "serverInfo": {"name": "zephyra", "version": crate::VERSION},
+            }),
+        )),
         "initialize" => {
             // 版本协商见 `negotiated_version`。`instructions` 会被 OpenCode /
             // Claude 等客户端注入系统提示，是「模型会用这些工具」的关键一环。
@@ -596,24 +1098,86 @@ fn handle_message(line: &str, session: &mut Session) -> Option<String> {
                 id,
                 json!({
                     "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
+                    "capabilities": {
+                        "tools": {"listChanged": false},
+                        "resources": {"subscribe": false, "listChanged": false}
+                    },
                     "serverInfo": {"name": "zephyra", "version": crate::VERSION},
                     "instructions": SERVER_INSTRUCTIONS
                 }),
             ))
         }
+        "resources/list" => Some(json_reply(
+            id,
+            json!({
+                "resources": RESOURCES.iter().map(|(uri, name, description, _)| json!({
+                    "uri": uri,
+                    "name": name,
+                    "description": description,
+                    "mimeType": "text/markdown",
+                })).collect::<Vec<_>>()
+            }),
+        )),
+        "resources/templates/list" => Some(json_reply(id, json!({"resourceTemplates": []}))),
+        "resources/read" => {
+            let uri = msg
+                .pointer("/params/uri")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match RESOURCES
+                .iter()
+                .find(|(candidate, _, _, _)| *candidate == uri)
+            {
+                Some((_, _, _, text)) => Some(json_reply(
+                    id,
+                    json!({
+                        "contents": [{
+                            "uri": uri,
+                            "mimeType": "text/markdown",
+                            "text": text,
+                        }]
+                    }),
+                )),
+                None => Some(error_reply(id, -32602, &format!("unknown resource: {uri}"))),
+            }
+        }
         "tools/list" => {
             let tools: Vec<Value> = TOOLS
                 .iter()
                 .map(|t| {
-                    json!({
+                    let mut schema = serde_json::from_str::<Value>(t.schema)
+                        .expect("内置工具的 schema 必须是合法 JSON");
+                    // 不碰桥的工具没有目标窗口可言，其余统一接受可选 window_id。
+                    if !NO_WINDOW_TOOLS.contains(&t.name) {
+                        if let Some(properties) = schema
+                            .get_mut("properties")
+                            .and_then(Value::as_object_mut)
+                        {
+                            properties.insert(
+                                "window_id".into(),
+                                json!({
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": "Target window id from list_windows. Optional only when exactly one window is connected."
+                                }),
+                            );
+                        }
+                    }
+                    let mut tool = json!({
                         "name": t.name,
                         "description": t.description,
-                        "inputSchema": serde_json::from_str::<Value>(t.schema)
-                            .expect("内置工具的 schema 必须是合法 JSON"),
+                        "inputSchema": schema,
                         "annotations": serde_json::from_str::<Value>(t.annotations)
                             .expect("内置工具的 annotations 必须是合法 JSON"),
-                    })
+                    });
+                    if let Some((_, output_schema)) = STRUCTURED_SCHEMAS
+                        .iter()
+                        .find(|(name, _)| *name == t.name)
+                    {
+                        tool["outputSchema"] = serde_json::from_str::<Value>(output_schema)
+                            .expect("内置工具的 outputSchema 必须是合法 JSON");
+                    }
+                    tool
                 })
                 .collect();
             Some(json_reply(id, json!({ "tools": tools })))
@@ -637,15 +1201,25 @@ fn handle_message(line: &str, session: &mut Session) -> Option<String> {
                     }),
                 ));
             }
+            session.progress_token = msg.pointer("/params/_meta/progressToken").cloned();
             let tool_args = msg
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or(json!({}));
             match run_tool(name, &tool_args, session, &id_key) {
-                Ok(ToolOutcome::Reply(text)) => Some(json_reply(
-                    id,
-                    json!({"content": [{"type": "text", "text": text}]}),
-                )),
+                Ok(ToolOutcome::Reply {
+                    text,
+                    structured,
+                    images,
+                }) => {
+                    let mut content = vec![json!({"type": "text", "text": text})];
+                    content.extend(images);
+                    let mut result = json!({"content": content});
+                    if let Some(value) = structured {
+                        result["structuredContent"] = value;
+                    }
+                    Some(json_reply(id, result))
+                }
                 Ok(ToolOutcome::Cancelled) => None,
                 Err(e) => Some(json_reply(
                     id,
@@ -679,8 +1253,10 @@ fn handle_message(line: &str, session: &mut Session) -> Option<String> {
 /// 偶发的重复点击糟得多；而且读超时要先冻结 10 秒，那时重试同样不会成功。
 fn with_bridge<T>(
     session: &mut Session,
+    a: &Value,
     f: impl Fn(&mut BridgeClient) -> Result<T, String>,
 ) -> Result<T, String> {
+    session.resolve_target(a)?;
     let first = f(session.ensure_client()?);
     match first {
         Ok(v) => Ok(v),
@@ -700,13 +1276,32 @@ fn with_bridge<T>(
 }
 
 /// 工具执行的结果。`Cancelled` = 请求已被取消，按协议**不回**。
+///
+/// `structured` 是可选的 `structuredContent`（与文本 content 同时返回）；
+/// `images` 是可选的 base64 image content（目前只有 `screenshot inline=true` 用）。
 enum ToolOutcome {
-    Reply(String),
+    Reply {
+        text: String,
+        structured: Option<Value>,
+        images: Vec<Value>,
+    },
     Cancelled,
 }
 
 fn reply(text: String) -> Result<ToolOutcome, String> {
-    Ok(ToolOutcome::Reply(text))
+    Ok(ToolOutcome::Reply {
+        text,
+        structured: None,
+        images: Vec::new(),
+    })
+}
+
+fn reply_structured(text: String, structured: Value) -> Result<ToolOutcome, String> {
+    Ok(ToolOutcome::Reply {
+        text,
+        structured: Some(structured),
+        images: Vec::new(),
+    })
 }
 
 /// 桥响应 → 文本正文（或应用侧错误）。
@@ -733,18 +1328,57 @@ fn run_tool(
     cancel_key: &str,
 ) -> Result<ToolOutcome, String> {
     match name {
+        // 发现窗口：不碰桥，只列已连入的连接。
+        "list_windows" => {
+            let windows = session.windows_structured();
+            let current = if session.clients.values().any(|link| link.client.is_some()) {
+                json!(session.current_target)
+            } else {
+                Value::Null
+            };
+            reply_structured(
+                session.list_windows_text(),
+                json!({"windows": windows, "currentTargetId": current}),
+            )
+        }
         // 身份是会话级信息，不碰桥 —— 没有应用连入也能答（告诉 AI 还没连上）。
-        "get_app_info" => reply(match &session.app_identity {
-            Some(id) => format!("app identity: {id}"),
-            None => "no app connected yet (or app did not send hello)".into(),
-        }),
-        "get_tree" => reply(text_of(with_bridge(session, |c| c.call("tree"))?)?),
-        "get_layout" => reply(text_of(with_bridge(session, |c| c.call("layout"))?)?),
-        "get_stats" => reply(text_of(with_bridge(session, |c| c.call("stats"))?)?),
-        "get_resources" => reply(text_of(with_bridge(session, |c| c.call("resources"))?)?),
-        "get_viewport" => reply(text_of(with_bridge(session, |c| c.call("viewport"))?)?),
+        "get_app_info" => {
+            if session.clients.is_empty() {
+                reply("no app connected yet (or app did not send hello)".into())
+            } else {
+                let id = session.resolve_target(a)?;
+                let label = window_label(id);
+                let identity = session
+                    .current_identity()
+                    .unwrap_or("(no hello)")
+                    .to_string();
+                reply_structured(
+                    format!("{label}: app identity: {identity}"),
+                    json!({"label": label, "identity": identity}),
+                )
+            }
+        }
+        "get_tree" => reply(text_of(with_bridge(session, a, |c| c.call("tree"))?)?),
+        "get_layout" => reply(text_of(with_bridge(session, a, |c| c.call("layout"))?)?),
+        "get_stats" => reply(text_of(with_bridge(session, a, |c| c.call("stats"))?)?),
+        "get_resources" => reply(text_of(with_bridge(session, a, |c| c.call("resources"))?)?),
+        "get_viewport" => {
+            let text = text_of(with_bridge(session, a, |c| c.call("viewport"))?)?;
+            // 桥回的是 "<宽> <高>"（物理像素）；解析成功才带 structuredContent，
+            // 解析不出来仍保留纯文本，绝不让结构化结果把工具调用搞挂。
+            let mut words = text.split_whitespace();
+            let width = words.next().and_then(|s| s.parse::<f64>().ok());
+            let height = words.next().and_then(|s| s.parse::<f64>().ok());
+            match (width, height) {
+                (Some(width), Some(height)) => reply_structured(
+                    text,
+                    json!({"width": width, "height": height, "unit": "physical-pixels"}),
+                ),
+                _ => reply(text),
+            }
+        }
         "ping" => {
-            let text = text_of(with_bridge(session, |c| c.call("ping"))?)?;
+            let text = text_of(with_bridge(session, a, |c| c.call("ping"))?)?;
             reply(format!(
                 "app reachable over the debug bridge ({text}) — 与「MCP server 已就绪」不同，这才说明应用在线"
             ))
@@ -754,43 +1388,43 @@ fn run_tool(
                 .get("path")
                 .and_then(|v| v.as_str())
                 .ok_or("get_props 需要 path 参数（来自 get_tree 的路径列）")?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("props {path}"))
             })?)?)
         }
         "hover" => {
             let (x, y) = xy(a)?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("hover {x} {y}"))
             })?)?)
         }
         "click" => {
             let (x, y) = xy(a)?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("click {x} {y}"))
             })?)?)
         }
         "click_by_key" => {
             let key = element_key(a)?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("click_key {key}"))
             })?)?)
         }
         "hover_by_key" => {
             let key = element_key(a)?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("hover_key {key}"))
             })?)?)
         }
         "click_by_path" => {
             let path = element_path(a)?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("click_path {path}"))
             })?)?)
         }
         "hover_by_path" => {
             let path = element_path(a)?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("hover_path {path}"))
             })?)?)
         }
@@ -805,19 +1439,21 @@ fn run_tool(
             {
                 return Err("key 必须是单个逻辑键名，不能包含空白或控制字符".into());
             }
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("press_key {key}"))
             })?)?)
         }
         "scroll" => {
             let (x, y) = xy(a)?;
             let (delta_x, delta_y) = deltas(a)?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("scroll {x} {y} {delta_x} {delta_y}"))
             })?)?)
         }
         "pointer_drag" => {
             let plan = drag_samples(a)?;
+            // 多命令手势：先定好目标，后续 drag_send 全走同一条连接。
+            session.resolve_target(a)?;
             match perform_pointer_drag(
                 session,
                 plan.start,
@@ -845,17 +1481,24 @@ fn run_tool(
                 .get("include_rows")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            text_of(with_bridge(session, |c| {
+            text_of(with_bridge(session, a, |c| {
                 c.call(&format!("profile_start {duration_seconds}"))
             })?)?;
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(duration_seconds + 10);
+            let started = std::time::Instant::now();
+            let deadline = started + std::time::Duration::from_secs(duration_seconds + 10);
+            let mut last_progress = u64::MAX;
             loop {
                 if session.cancelled.take(cancel_key) {
                     return Ok(ToolOutcome::Cancelled);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                let report = text_of(with_bridge(session, |c| c.call("profile_report"))?)?;
+                // 每秒最多一条通知：客户端能看出还在跑，又不会被通知流刷屏。
+                let elapsed = started.elapsed().as_secs().min(duration_seconds);
+                if elapsed != last_progress {
+                    last_progress = elapsed;
+                    session.notify_progress(elapsed, duration_seconds);
+                }
+                let report = text_of(with_bridge(session, a, |c| c.call("profile_report"))?)?;
                 if report.starts_with("PROFILE_STATE complete") {
                     return reply(if include_rows {
                         report
@@ -870,8 +1513,9 @@ fn run_tool(
         }
         "screenshot" => {
             let repaint = a.get("repaint").and_then(Value::as_bool).unwrap_or(false);
+            let inline = a.get("inline").and_then(Value::as_bool).unwrap_or(false);
             let cmd = if repaint { "shot --repaint" } else { "shot" };
-            let r = with_bridge(session, |c| c.call(cmd))?;
+            let r = with_bridge(session, a, |c| c.call(cmd))?;
             match r {
                 BridgeResponse::Binary { data, .. } => {
                     if data.is_empty() {
@@ -896,7 +1540,7 @@ fn run_tool(
                     // ⚠ 报的是**落盘后**的大小：转成 PNG 之后大小会变，
                     // 报线上那个字节数会让人以为文件被截断了。
                     let written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    reply(format!(
+                    let text = format!(
                         "screenshot written to {path} ({} bytes, {}{})",
                         written,
                         format,
@@ -905,7 +1549,25 @@ fn run_tool(
                         } else {
                             ", damage region kept (stale pixels stay visible)"
                         }
-                    ))
+                    );
+                    let mut structured = json!({"path": path, "bytes": written, "format": format});
+                    let mut images = Vec::new();
+                    if inline {
+                        // 内联只回 PNG：原 BMP 大且多数客户端不认；编码复用落盘那条路。
+                        let png = crate::shot::bmp_to_png(&data)?;
+                        let base64 = base64::engine::general_purpose::STANDARD.encode(&png);
+                        images.push(json!({
+                            "type": "image",
+                            "data": base64,
+                            "mimeType": "image/png",
+                        }));
+                        structured["inline"] = json!(true);
+                    }
+                    Ok(ToolOutcome::Reply {
+                        text,
+                        structured: Some(structured),
+                        images,
+                    })
                 }
                 BridgeResponse::Err(e) => Err(e),
                 BridgeResponse::Text(_) => Err("桥回了文本而不是图像".into()),
@@ -919,7 +1581,7 @@ fn run_tool(
             if frames > 10_000 {
                 return Err("frames 不能超过 10000".into());
             }
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("wait_frames {frames}"))
             })?)?)
         }
@@ -933,13 +1595,13 @@ fn run_tool(
                 .and_then(Value::as_u64)
                 .ok_or("touch 需要 pointer_id 参数（哪一根手指）")?;
             let (x, y) = xy(a)?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("touch {phase} {pointer_id} {x} {y}"))
             })?)?)
         }
         "hit_test" => {
             let (x, y) = xy(a)?;
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("hit {x} {y}"))
             })?)?)
         }
@@ -955,7 +1617,7 @@ fn run_tool(
             if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
                 return Err("宽高要在 1..=16384 之间".into());
             }
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("resize {width} {height}"))
             })?)?)
         }
@@ -967,7 +1629,7 @@ fn run_tool(
             if text.trim().is_empty() {
                 return Err("text 不能是空白".into());
             }
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("find {}", quote_argument(text)))
             })?)?)
         }
@@ -979,7 +1641,7 @@ fn run_tool(
             if text.is_empty() {
                 return Err("text 不能是空的".into());
             }
-            reply(text_of(with_bridge(session, |c| {
+            reply(text_of(with_bridge(session, a, |c| {
                 c.call(&format!("type_text {}", quote_argument(text)))
             })?)?)
         }
@@ -1021,7 +1683,7 @@ fn resolve_shot_path(a: &Value) -> String {
     match a.get("path").and_then(Value::as_str) {
         Some(p) if !p.is_empty() => absolute_path(p),
         _ => std::env::temp_dir()
-            .join(format!("zephyra-shot-{}.bmp", std::process::id()))
+            .join(format!("zephyra-shot-{}.png", std::process::id()))
             .display()
             .to_string(),
     }
@@ -1337,11 +1999,12 @@ fn perform_pointer_drag(
         if hold_before_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(hold_before_ms));
         }
-        for sample in samples {
+        for (index, sample) in samples.iter().enumerate() {
             drag_send(session, &format!("hover {} {}", sample.x, sample.y))?;
             if sample.delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(sample.delay_ms));
             }
+            session.notify_progress((index + 1) as u64, samples.len() as u64);
         }
         if hold_after_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(hold_after_ms));
@@ -1523,6 +2186,45 @@ mod tests {
         (port, rx)
     }
 
+    /// 回一条合法 1x1 24bpp BMP，供 inline 截图测试走真实 BMP→PNG 转换。
+    fn mock_bridge_binary_valid_bmp() -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bmp = tiny_bmp();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            writeln!(stream, "BIN {} bmp 24bpp", bmp.len()).unwrap();
+            stream.write_all(&bmp).unwrap();
+            stream.write_all(b"\nOK\n").unwrap();
+        });
+        port
+    }
+
+    /// 54 字节头 + 4 字节像素（1x1，BGR + 行对齐）。
+    fn tiny_bmp() -> Vec<u8> {
+        let pixels: [u8; 4] = [1, 2, 3, 0];
+        let mut out = Vec::new();
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&((54 + pixels.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&pixels);
+        out
+    }
+
     #[test]
     fn initialize_announces_tools_capability() {
         let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
@@ -1534,7 +2236,7 @@ mod tests {
         assert!(r.contains("\"protocolVersion\""), "{r}");
         assert!(r.contains("serverInfo"), "{r}");
         // 握手不碰桥——AI 客户端先配 MCP 再起应用是常态。
-        assert!(session.client.is_none());
+        assert!(session.client().is_none());
     }
 
     /// 版本协商按 MCP 规范：客户端要的版本我们支持就原样回；不认识就回我们
@@ -1564,20 +2266,30 @@ mod tests {
 
     /// 生产拓扑：没有应用连入就明确报错；连入后工具走那条已建立的流。
     #[test]
-    fn inbound_session_uses_app_stream_and_reports_when_absent() {
-        let mut absent = Session::inbound("127.0.0.1", 1, Cancelled::default());
+    fn outbound_session_uses_app_stream_and_reports_when_absent() {
+        let mut absent = Session::outbound(
+            "127.0.0.1",
+            1,
+            Cancelled::default(),
+            Arc::new(Mutex::new(HashSet::new())),
+        );
         let r = handle_message(
             r#"{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"ping","arguments":{}}}"#,
             &mut absent,
         )
         .unwrap();
-        assert!(r.contains("应用尚未连入 MCP"), "{r}");
+        assert!(r.contains("连不上应用调试桥"), "{r}");
         assert!(r.contains("isError"), "{r}");
 
         let (port, seen) = mock_bridge("pong");
         let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let mut session = Session::inbound("127.0.0.1", port, Cancelled::default());
-        session.attach(BridgeClient::from_stream(stream), None);
+        let mut session = Session::outbound(
+            "127.0.0.1",
+            port,
+            Cancelled::default(),
+            Arc::new(Mutex::new(HashSet::new())),
+        );
+        session.attach(0, BridgeClient::from_stream(stream), None);
         let r = handle_message(
             r#"{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"ping","arguments":{}}}"#,
             &mut session,
@@ -1597,7 +2309,7 @@ mod tests {
             handle_message(r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#, &mut session).unwrap();
         assert!(r.contains("\"result\":{}"), "{r}");
         assert!(!r.contains("isError"), "{r}");
-        assert!(session.client.is_none());
+        assert!(session.client().is_none());
     }
 
     /// 工具层的 `ping` 走桥：回执必须点明「这才说明应用在线」。
@@ -1635,6 +2347,7 @@ mod tests {
         .unwrap();
         for t in [
             "get_app_info",
+            "list_windows",
             "get_tree",
             "get_layout",
             "get_props",
@@ -1652,7 +2365,143 @@ mod tests {
         ] {
             assert!(r.contains(t), "tools/list 缺 {t}：{r}");
         }
-        assert!(session.client.is_none(), "tools/list 也不该碰桥");
+        assert!(session.client().is_none(), "tools/list 也不该碰桥");
+    }
+
+    /// `auto` 协议探测要能拿到最新修订，避免客户端退回 legacy。
+    #[test]
+    fn server_discover_advertises_latest_protocol() {
+        let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}"#,
+            &mut session,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(
+            parsed["result"]["protocolVersion"], PROTOCOL_VERSIONS[0],
+            "{parsed}"
+        );
+    }
+
+    /// 技能文档通过 MCP resources 暴露，客户端不必扫本地 skills 目录。
+    #[test]
+    fn resources_expose_skill_docs() {
+        let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        let listed = handle_message(
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#,
+            &mut session,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&listed).unwrap();
+        let resources = parsed["result"]["resources"].as_array().unwrap();
+        assert!(resources.iter().any(|r| r["uri"] == "zephyra://skill"));
+
+        let read = handle_message(
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"zephyra://skill"}}"#,
+            &mut session,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&read).unwrap();
+        let text = parsed["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ZephyraUI MCP"), "{text}");
+    }
+
+    /// 进度通知形状固定：progressToken 原样回传，progress/total 是数字。
+    #[test]
+    fn progress_notification_shape() {
+        let line = progress_notification(&json!("tok-1"), 3, 10);
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["method"], "notifications/progress");
+        assert_eq!(parsed["params"]["progressToken"], "tok-1");
+        assert_eq!(parsed["params"]["progress"], 3);
+        assert_eq!(parsed["params"]["total"], 10);
+    }
+
+    /// 结构化返回要在 tools/list 里声明 outputSchema，否则客户端不知道怎么解析。
+    #[test]
+    fn tools_list_declares_structured_outputs() {
+        let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &mut session,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&r).unwrap();
+        let tools = parsed["result"]["tools"].as_array().unwrap();
+        for name in ["list_windows", "get_viewport", "get_app_info", "screenshot"] {
+            let tool = tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("tools/list 缺 {name}"));
+            assert!(
+                tool.get("outputSchema").is_some(),
+                "{name} 缺 outputSchema：{tool}"
+            );
+        }
+    }
+
+    /// list_windows 的结构化结果必须能直接取字段，不用解析文本。
+    #[test]
+    fn list_windows_returns_structured_data() {
+        let (port0, _) = mock_bridge("pong");
+        let (port1, _) = mock_bridge("pong");
+        let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        for (id, port, identity) in [(0, port0, "app zero"), (1, port1, "app one")] {
+            session.attach(
+                id,
+                BridgeClient::connect("127.0.0.1", port, 3).unwrap(),
+                Some(identity.to_string()),
+            );
+        }
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_windows","arguments":{}}}"#,
+            &mut session,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&r).unwrap();
+        let windows = parsed["result"]["structuredContent"]["windows"]
+            .as_array()
+            .unwrap();
+        assert_eq!(windows.len(), 2, "{parsed}");
+        assert_eq!(windows[0]["id"], 0);
+        assert_eq!(windows[0]["identity"], "app zero");
+        assert_eq!(windows[1]["identity"], "app one");
+        assert!(
+            parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("current target"),
+            "文本回执也要保留可读的当前目标"
+        );
+    }
+
+    /// get_app_info 也接受 window_id，多窗口时能点名问身份。
+    #[test]
+    fn get_app_info_targets_a_window_by_id() {
+        let (port0, _) = mock_bridge("pong");
+        let (port1, _) = mock_bridge("pong");
+        let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        session.attach(
+            0,
+            BridgeClient::connect("127.0.0.1", port0, 3).unwrap(),
+            Some("app zero".into()),
+        );
+        session.attach(
+            1,
+            BridgeClient::connect("127.0.0.1", port1, 3).unwrap(),
+            Some("app one".into()),
+        );
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_app_info","arguments":{"window_id":1}}}"#,
+            &mut session,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(
+            parsed["result"]["structuredContent"]["identity"], "app one",
+            "{parsed}"
+        );
     }
 
     /// annotations 必须把「只读」与「会改状态」分开：AI 客户端据此决定哪些
@@ -1708,7 +2557,7 @@ mod tests {
         assert_eq!(seen.recv().unwrap(), "tree");
         assert!(r.contains("0 Container root"), "{r}");
         assert!(!r.contains("\"isError\":true"), "{r}");
-        assert!(session.client.is_some(), "工具调用后连接应当被缓存复用");
+        assert!(session.client().is_some(), "工具调用后连接应当被缓存复用");
     }
 
     /// 应用重启（dev 工作流常态）会留下一条死连接。传输失败必须**丢连接、
@@ -1743,7 +2592,7 @@ mod tests {
             &mut session,
         );
         assert!(r.is_none(), "被取消的请求按协议不回：{r:?}");
-        assert!(session.client.is_none(), "被取消的调用不该碰桥");
+        assert!(session.client().is_none(), "被取消的调用不该碰桥");
     }
 
     /// 在途的 `analyze_performance` 要能被取消：采集循环的每轮轮询间隙
@@ -1807,7 +2656,7 @@ mod tests {
         .unwrap();
         assert!(r.contains("\"isError\":true"), "{r}");
         assert!(r.contains("f32"), "报错要说明原因：{r}");
-        assert!(session.client.is_none(), "参数错误不该建立连接");
+        assert!(session.client().is_none(), "参数错误不该建立连接");
     }
 
     #[test]
@@ -1854,7 +2703,7 @@ mod tests {
         )
         .unwrap();
         assert!(r.contains("\"isError\":true"), "{r}");
-        assert!(session.client.is_none(), "注入内容应在连接桥之前拒绝");
+        assert!(session.client().is_none(), "注入内容应在连接桥之前拒绝");
     }
 
     #[test]
@@ -1879,7 +2728,7 @@ mod tests {
         )
         .unwrap();
         assert!(response.contains("\"isError\":true"), "{response}");
-        assert!(session.client.is_none(), "无效路径必须在建立桥连接前拒绝");
+        assert!(session.client().is_none(), "无效路径必须在建立桥连接前拒绝");
     }
 
     #[test]
@@ -2003,6 +2852,46 @@ mod tests {
         assert!(profile_duration_seconds(&json!({"duration_seconds": 301})).is_err());
     }
 
+    /// 不传 path 时默认导出 PNG（临时目录、绝对路径）。
+    #[test]
+    fn screenshot_default_path_is_png() {
+        let path = resolve_shot_path(&serde_json::json!({}));
+        assert!(path.ends_with(".png"), "{path}");
+        assert!(
+            std::path::Path::new(&path).is_absolute(),
+            "默认路径必须是绝对路径：{path}"
+        );
+    }
+
+    /// inline=true 要同时回文本路径、结构化结果和 base64 image content。
+    #[test]
+    fn screenshot_inline_returns_image_content() {
+        let port = mock_bridge_binary_valid_bmp();
+        let mut session = Session::new("127.0.0.1", port, Cancelled::default());
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"screenshot","arguments":{"inline":true}}}"#,
+            &mut session,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&r).unwrap();
+        let content = parsed["result"]["content"].as_array().unwrap();
+        assert!(content.len() >= 2, "text + image：{parsed}");
+        let image = content
+            .iter()
+            .find(|c| c["type"] == "image")
+            .expect("要含 image content");
+        assert_eq!(image["mimeType"], "image/png");
+        let data = image["data"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert_eq!(&decoded[..8], b"\x89PNG\r\n\x1a\n", "必须是真 PNG");
+        assert_eq!(
+            parsed["result"]["structuredContent"]["format"], "PNG",
+            "{parsed}"
+        );
+    }
+
     /// 截图回执必须是**绝对**路径：AI 客户端不知道本进程的 cwd，相对路径
     /// 等于没说。
     #[test]
@@ -2112,9 +3001,139 @@ mod tests {
     fn mcp_port_env_matches_bridge() {
         assert_eq!(crate::commands::MCP_PORT_ENV, zephyra_fx::MCP_PORT_ENV);
     }
+
+    /// CDP 式拓扑用工的环境变量名也必须与框架侧一致。
+    #[test]
+    fn bridge_port_env_matches_bridge() {
+        assert_eq!(crate::commands::BRIDGE_PORT_ENV, zephyra_fx::PORT_ENV);
+    }
+
+    /// CDP 式端口规划：基址 + id；老应用（无 id）仍用基址。
+    #[test]
+    fn window_id_maps_to_base_port_offset() {
+        let session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        assert_eq!(session.port_for(0), 7878);
+        assert_eq!(session.port_for(3), 7881);
+        assert_eq!(session.port_for(LEGACY_WINDOW_ID), 7878);
+    }
+
+    /// 连出发现：桥对 `identify` 的应答要解析成 AppHello（含窗口 id）。
+    #[test]
+    fn identify_reads_window_id_from_bridge() {
+        let (port, seen) = mock_bridge("hello app 1.0 3");
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut client = BridgeClient::from_stream(stream);
+        let hello = client.identify().unwrap();
+        assert_eq!(seen.recv().unwrap(), "identify");
+        assert_eq!(hello.identity, "app 1.0");
+        assert_eq!(hello.window_id, Some(3));
+    }
+
+    /// 两个窗口各连一条桥：表必须同时保留，list_windows 列得出两个 id。
+    #[test]
+    fn two_windows_are_both_kept_and_listable() {
+        let (port0, _rx0) = mock_bridge("from-zero");
+        let (port1, _rx1) = mock_bridge("from-one");
+        let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        session.attach(
+            0,
+            BridgeClient::connect("127.0.0.1", port0, 3).unwrap(),
+            Some("gallery 0.1.0".into()),
+        );
+        session.attach(
+            1,
+            BridgeClient::connect("127.0.0.1", port1, 3).unwrap(),
+            Some("gallery 0.1.0".into()),
+        );
+
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_windows","arguments":{}}}"#,
+            &mut session,
+        )
+        .unwrap();
+        assert!(r.contains("id=0"), "{r}");
+        assert!(r.contains("id=1"), "{r}");
+        assert!(r.contains("window#0"), "{r}");
+        assert!(r.contains("window#1"), "{r}");
+    }
+
+    /// 指定 window_id 时命令必须落到对应窗口；多个窗口又没指定时宁可报错。
+    #[test]
+    fn window_id_routes_to_the_right_bridge() {
+        let (port0, _rx0) = mock_bridge("from-zero");
+        let (port1, _rx1) = mock_bridge("from-one");
+        let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        session.attach(
+            0,
+            BridgeClient::connect("127.0.0.1", port0, 3).unwrap(),
+            None,
+        );
+        session.attach(
+            1,
+            BridgeClient::connect("127.0.0.1", port1, 3).unwrap(),
+            None,
+        );
+
+        // 不选目标：多个窗口在线时应报错，绝不猜一个。
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tree","arguments":{}}}"#,
+            &mut session,
+        )
+        .unwrap();
+        assert!(r.contains("\"isError\":true"), "{r}");
+        assert!(r.contains("list_windows"), "{r}");
+
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_tree","arguments":{"window_id":1}}}"#,
+            &mut session,
+        )
+        .unwrap();
+        assert!(r.contains("from-one"), "{r}");
+        assert!(!r.contains("from-zero"), "{r}");
+    }
+
+    /// 一个窗口重连只替换自己的连接，不影响另一个窗口。
+    #[test]
+    fn reconnect_of_one_window_keeps_the_other() {
+        let (port0, _rx0) = mock_bridge("from-zero");
+        let (port1, _rx1) = mock_bridge("from-one");
+        let (port0b, _rx0b) = mock_bridge("from-zero-again");
+        let mut session = Session::new("127.0.0.1", 7878, Cancelled::default());
+        session.attach(
+            0,
+            BridgeClient::connect("127.0.0.1", port0, 3).unwrap(),
+            Some("old".into()),
+        );
+        session.attach(
+            1,
+            BridgeClient::connect("127.0.0.1", port1, 3).unwrap(),
+            Some("other".into()),
+        );
+        session.attach(
+            0,
+            BridgeClient::connect("127.0.0.1", port0b, 3).unwrap(),
+            Some("new".into()),
+        );
+
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_windows","arguments":{}}}"#,
+            &mut session,
+        )
+        .unwrap();
+        assert!(r.contains("id=0") && r.contains("id=1"), "{r}");
+        assert!(r.contains("new") && r.contains("other"), "{r}");
+
+        let r = handle_message(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_tree","arguments":{"window_id":1}}}"#,
+            &mut session,
+        )
+        .unwrap();
+        assert!(r.contains("from-one"), "{r}");
+    }
 }
 
-/// 身份行的读者必须与桥的写法对齐：`hello <name> <version>` 一行，不含其它。
+/// 身份行的读者必须与桥的写法对齐：`hello <name> <version> [<window-id>]` 一行，
+/// 不含其它。第三段可选：老应用没有它，多窗口应用每个窗口各报自己的 id。
 #[test]
 fn read_hello_consumes_only_the_identity_line() {
     use std::io::Write;
@@ -2129,7 +3148,47 @@ fn read_hello_consumes_only_the_identity_line() {
     let mut client = crate::bridge_client::BridgeClient::from_stream(stream);
     let hello = client.read_hello();
     server.join().unwrap();
-    assert_eq!(hello.as_deref(), Some("gallery 0.1.0"));
+    let hello = hello.unwrap();
+    assert_eq!(hello.identity, "gallery 0.1.0");
+    assert_eq!(hello.window_id, None);
+}
+
+/// 新格式：第三段是数字窗口 id；app 名带空格也不该被拆错（从右往左解析）。
+#[test]
+fn read_hello_parses_optional_window_id() {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"hello my gallery 0.1.0 42\n").unwrap();
+        stream
+    });
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    let mut client = crate::bridge_client::BridgeClient::from_stream(stream);
+    let hello = client.read_hello().unwrap();
+    server.join().unwrap();
+    assert_eq!(hello.identity, "my gallery 0.1.0");
+    assert_eq!(hello.window_id, Some(42));
+}
+
+/// 纯数字版本号的老应用不能被误读成带 window id 的新格式。
+#[test]
+fn read_hello_does_not_mistake_numeric_version_for_window_id() {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"hello app 123\n").unwrap();
+        stream
+    });
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    let mut client = crate::bridge_client::BridgeClient::from_stream(stream);
+    let hello = client.read_hello().unwrap();
+    server.join().unwrap();
+    assert_eq!(hello.identity, "app 123");
+    assert_eq!(hello.window_id, None);
 }
 
 #[test]
@@ -2141,5 +3200,5 @@ fn get_app_info_without_app_says_so() {
         )
         .unwrap();
     assert!(r.contains("no app"), "{r}");
-    assert!(session.client.is_none(), "get_app_info 不该碰桥");
+    assert!(session.client().is_none(), "get_app_info 不该碰桥");
 }

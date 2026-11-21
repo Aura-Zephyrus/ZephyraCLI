@@ -19,6 +19,37 @@ pub(crate) struct BridgeClient {
     buf: Vec<u8>,
 }
 
+/// 应用连入后的身份帧：`hello <app-name> <version> [<window-id>]`。
+///
+/// 第三段是可选的：多窗口应用（同一进程用 `WindowSet` 开多个窗口）里每个窗口
+/// 各连一条桥，各自报自己的 `WindowKey`，MCP 据此把工具调用路由到目标窗口。
+/// 老应用 / 单窗口兼容路径不带第三段，`window_id` 为 `None`。
+pub(crate) struct AppHello {
+    /// `hello ` 之后的身份文本（不含 window id）。给 `get_app_info` 用。
+    pub(crate) identity: String,
+    pub(crate) window_id: Option<u64>,
+}
+
+/// 从右往左拆可选的 window id：app 名可能带空格，不能从左数词。
+fn parse_hello(rest: &str) -> AppHello {
+    if let Some((head, tail)) = rest.rsplit_once(' ') {
+        // head 至少要留着「app 名 + version」两段；否则 `hello app 123`
+        // 这种版本号恰好是纯数字的老应用会被误读成 window id=123。
+        if head.contains(' ') {
+            if let Ok(id) = tail.parse::<u64>() {
+                return AppHello {
+                    identity: head.to_string(),
+                    window_id: Some(id),
+                };
+            }
+        }
+    }
+    AppHello {
+        identity: rest.to_string(),
+        window_id: None,
+    }
+}
+
 /// 一条桥响应（与 `zephyra_fx::bridge::Response` 同构，但 CLI 侧只看文本形状）。
 pub(crate) enum BridgeResponse {
     /// 文本正文（不含 `OK` 终止行）。
@@ -81,16 +112,18 @@ impl BridgeClient {
         Err(last.unwrap_or_else(|| std::io::Error::other("connect failed")))
     }
 
-    /// 读应用连入后主动发来的身份行（`hello <app-name> <version>`）。
+    /// 读应用连入后主动发来的身份行（`hello <app-name> <version> [<window-id>]`）。
     ///
     /// 必须在新连接的第一次 [`Self::call`] **之前**调用：应用把身份作为第一帧
     /// 发出，不先读掉，下一句命令的响应就会读到它，协议整体错位一格。
     ///
-    /// 短超时（200 ms × 4）且兼容旧应用：连上却没发 hello 时返回 `None`。
+    /// 短超时（200 ms × 4）且兼容旧应用：连上却没发 hello 时返回 `None`；
+    /// hello 没有第三段时 [`AppHello::window_id`] 为 `None`。
     ///
     /// ⚠ 调用方必须放在**连接接受线程**里，不要占用 MCP 唯一的工作线程 ——
     /// 应用帧循环停摆时这里最坏阻塞几百 ms，工作线程要继续应答工具调用。
-    pub(crate) fn read_hello(&mut self) -> Option<String> {
+    #[cfg(test)]
+    pub(crate) fn read_hello(&mut self) -> Option<AppHello> {
         self.stream
             .set_read_timeout(Some(std::time::Duration::from_millis(200)))
             .ok();
@@ -101,14 +134,15 @@ impl BridgeClient {
         result
     }
 
-    fn read_hello_inner(&mut self) -> Option<String> {
+    #[cfg(test)]
+    fn read_hello_inner(&mut self) -> Option<AppHello> {
         let mut chunk = [0u8; 512];
         // 通常一次 read 就拿到整行；半行时再读几次（仍在同一 200 ms 超时内）。
         for _ in 0..4 {
             if let Some(end) = self.buf.iter().position(|&b| b == b'\n') {
                 let line = String::from_utf8_lossy(&self.buf[..end]).into_owned();
                 self.buf.drain(..=end);
-                return line.strip_prefix("hello ").map(|s| s.to_string());
+                return line.strip_prefix("hello ").map(parse_hello);
             }
             match self.stream.read(&mut chunk) {
                 Ok(0) => {
@@ -126,6 +160,32 @@ impl BridgeClient {
         // 当成响应开头，协议整体错位一格。
         self.buf.clear();
         None
+    }
+
+    /// 连出发现：向监听端发 `identify`，桥回 `hello <app> <version> <window-id>`。
+    ///
+    /// 只在连接刚建立时调用；短超时避免连到一个僵死应用时把发现线程卡住。
+    /// 不复用 [`Self::read_hello`]（那是旧拓扑里应用连入后主动发的帧）。
+    pub(crate) fn identify(&mut self) -> Option<AppHello> {
+        self.stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .ok();
+        let result = self.identify_inner();
+        self.stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        result
+    }
+
+    fn identify_inner(&mut self) -> Option<AppHello> {
+        self.stream.write_all(b"identify\n").ok()?;
+        self.stream.flush().ok()?;
+        match self.read_response().ok()? {
+            BridgeResponse::Text(lines) => lines
+                .first()
+                .and_then(|line| line.strip_prefix("hello ").map(parse_hello)),
+            _ => None,
+        }
     }
 
     /// 发一条命令并读一条响应。

@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::{
-    app_config_path, cargo_path, mcp_port_for_child, project_root, spawn_pumped, CliError,
-    PumpedChild, Write, DEV_ASSETS_ENV, MCP_PORT_ENV,
+    app_config_path, bridge_port_for_child, cargo_path, project_root, spawn_pumped, CliError,
+    PumpedChild, Write, BRIDGE_PORT_ENV, DEV_ASSETS_ENV, MCP_PORT_ENV,
 };
 use crate::args::Args;
 use crate::ExitCode;
@@ -213,8 +213,9 @@ fn spawn_cargo(
     if let Some(path) = config_path {
         command.env("ZEPHYRA_APP_CONFIG_PATH", path);
     }
-    // 应用据此连入 MCP（agent 只跟 MCP 说 stdio）。
-    command.env(MCP_PORT_ENV, mcp_port_for_child());
+    // 应用监听这个基址（每窗口 +id）；MCP 进程会连出来。
+    command.env(BRIDGE_PORT_ENV, bridge_port_for_child());
+    command.env_remove(MCP_PORT_ENV);
     let child = command
         .spawn()
         .map_err(|e| CliError::missing(format!("cannot run {}: {e}", cargo.display())))?;

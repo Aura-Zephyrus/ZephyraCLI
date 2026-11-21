@@ -298,7 +298,7 @@ fn split_out_path(cmd: &str) -> (String, Option<std::path::PathBuf>) {
 /// 截图没指定路径时的默认落点（临时目录）。
 fn default_shot_path() -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
-    path.push(format!("zephyra-shot-{}.bmp", std::process::id()));
+    path.push(format!("zephyra-shot-{}.png", std::process::id()));
     path
 }
 
@@ -402,6 +402,17 @@ fn list_instances(host: &str, io: &mut dyn Write) -> Result<ExitCode, CliError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 人工排查入口的默认截图也导出 PNG。
+    #[test]
+    fn default_shot_path_is_png() {
+        let path = default_shot_path();
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("png"),
+            "{path:?}"
+        );
+    }
 
     /// `--out <path>` 是**客户端侧**选项：必须从发给应用的命令里摘掉。
     ///

@@ -804,6 +804,82 @@ fn debug_watch_takes_the_whole_command_as_positional() {
     assert_eq!(a.positional, vec!["watch", "props", "0.1.0.1"]);
 }
 
+/// `new` 必须在工程里留下项目级 MCP 配置、agent skill 和 .gitignore。
+#[test]
+fn scaffold_initializes_agent_and_gitignore() {
+    let dir = std::env::temp_dir().join("zephyra-cli-agent-probe");
+    let _ = std::fs::remove_dir_all(&dir);
+    let ParseOutcome::Parsed(a) = args::parse(vec![
+        "new".into(),
+        "app".into(),
+        "--path".into(),
+        dir.display().to_string(),
+    ]) else {
+        panic!()
+    };
+    let mut cap = Cap::default();
+    (commands::find("new").unwrap().run)(&a, &mut cap).unwrap();
+
+    let root = dir.join("app");
+    let cfg = std::fs::read_to_string(root.join(".opencode/opencode.jsonc")).unwrap();
+    assert!(cfg.contains("zephyra"), "project MCP config: {cfg}");
+    assert!(root.join(".opencode/skills/zephyra-mcp/SKILL.md").exists());
+    assert!(root
+        .join(".opencode/skills/zephyra-mcp/references/tools.md")
+        .exists());
+    assert!(root.join(".gitignore").exists());
+
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains("vulkan"),
+        "Vulkan backend in template: {manifest}"
+    );
+    assert!(
+        manifest.contains("d3d12") || manifest.contains("vulkan"),
+        "a default backend must be selected"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--no-agent` 只生成工程文件，不写 agent 配置。
+#[test]
+fn scaffold_no_agent_skips_project_config() {
+    let dir = std::env::temp_dir().join("zephyra-cli-no-agent-probe");
+    let _ = std::fs::remove_dir_all(&dir);
+    let ParseOutcome::Parsed(a) = args::parse(vec![
+        "new".into(),
+        "app".into(),
+        "--path".into(),
+        dir.display().to_string(),
+        "--no-agent".into(),
+    ]) else {
+        panic!()
+    };
+    let mut cap = Cap::default();
+    (commands::find("new").unwrap().run)(&a, &mut cap).unwrap();
+    assert!(dir.join("app/src/main.rs").exists());
+    assert!(!dir.join("app/.opencode").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `init` 给已有目录补 agent 配置和 .gitignore，且不覆盖已有配置。
+#[test]
+fn init_adds_agent_config_to_existing_dir() {
+    let dir = std::env::temp_dir().join("zephyra-cli-init-probe");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ParseOutcome::Parsed(a) = args::parse(vec!["init".into(), dir.display().to_string()])
+    else {
+        panic!()
+    };
+    let mut cap = Cap::default();
+    (commands::find("init").unwrap().run)(&a, &mut cap).unwrap();
+    assert!(dir.join(".opencode/opencode.jsonc").exists());
+    assert!(dir.join(".opencode/skills/zephyra-mcp/SKILL.md").exists());
+    assert!(dir.join(".gitignore").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- `fmt` ----
 
 /// 跑一次 `fmt`，拿到 (退出码, stdout, stderr)。

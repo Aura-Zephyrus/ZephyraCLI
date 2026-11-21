@@ -26,6 +26,15 @@ pub fn main_entry() -> ProcessExit {
     // dispatch 全程握着那两把锁，工作线程会在第一次 `eprintln!`/`stdout.lock()`
     // 上永久死锁——实测：`initialize`/`ping`（主线程就地处理，重入锁成功）正常，
     // 所有 `tools/call`（投工作线程）无应答。所以锁必须在每次调用内自取自放。
+    // `--json`：把所有输出收进内存，最后只吐一行 JSON 信封。agent 不必再解析
+    // 人类可读的混合流；退出码与 stdout / stderr 分行返回。
+    if argv.iter().any(|a| a == "--json") {
+        let mut capture = Capture::default();
+        let code = dispatch(&bin, argv, &mut capture);
+        println!("{}", json_envelope(code, &capture));
+        return ProcessExit::from(code.code());
+    }
+
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
     let mut io = Io {
@@ -34,6 +43,31 @@ pub fn main_entry() -> ProcessExit {
     };
 
     ProcessExit::from(dispatch(&bin, argv, &mut io).code())
+}
+
+fn json_envelope(code: ExitCode, capture: &Capture) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "ok": code == ExitCode::Success,
+        "exitCode": code.code(),
+        "stdout": capture.out,
+        "stderr": capture.err,
+    }))
+    .unwrap()
+}
+
+#[derive(Default)]
+struct Capture {
+    out: Vec<String>,
+    err: Vec<String>,
+}
+
+impl Write for Capture {
+    fn line(&mut self, s: &str) {
+        self.out.push(s.to_string());
+    }
+    fn err_line(&mut self, s: &str) {
+        self.err.push(s.to_string());
+    }
 }
 
 /// 把名字列表渲染成 `--a --b`；空表给 `(none)`，免得报错里是一行空白。
@@ -104,6 +138,11 @@ fn dispatch(bin: &str, argv: Vec<String>, io: &mut dyn Write) -> ExitCode {
     let after_ddash = parsed.positional.iter().any(|x| x == "--");
     if !after_ddash {
         for f in parsed.flags() {
+            // `--json` 是全局输出模式，不属于任何具体命令。
+            if f == "json" {
+                continue;
+            }
+
             if !cmd.accepts_flag(f) {
                 io.err_line(&format!(
                     "error: unknown flag `--{f}` for `{bin} {}`",
@@ -169,5 +208,36 @@ pub fn display_name(argv0: Option<String>) -> String {
     match stem.strip_prefix("cargo-") {
         Some(rest) => format!("cargo {rest}"),
         None => stem.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_envelope_separates_streams_and_exit_code() {
+        let mut capture = Capture::default();
+        capture.line("hello");
+        capture.err_line("warn");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_envelope(ExitCode::Failure, &capture)).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["exitCode"], 1);
+        assert_eq!(parsed["stdout"][0], "hello");
+        assert_eq!(parsed["stderr"][0], "warn");
+    }
+
+    #[test]
+    fn global_json_flag_is_accepted_by_every_command() {
+        let mut capture = Capture::default();
+        let code = dispatch(
+            "zephyra",
+            vec!["info".into(), "--json".into()],
+            &mut capture,
+        );
+        assert_eq!(code, ExitCode::Success);
+        assert!(!capture.out.is_empty());
+        assert!(capture.err.is_empty(), "{:?}", capture.err);
     }
 }

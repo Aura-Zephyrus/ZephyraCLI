@@ -3,11 +3,30 @@
 > 主文档：`skills/zephyra-mcp/SKILL.md`。本文只讲**每个工具的参数与语义**；
 > 返回文本的逐字格式见 `output-formats.md`。
 
-所有坐标一律**物理像素、绝对坐标**。所有工具都经同一个桥会话串行执行。
+所有坐标一律**物理像素、绝对坐标**（且是**每个窗口各自一套**，跨窗口不能直接抄坐标）。所有工具都在唯一的工作线程上串行执行，但每个窗口各有自己的桥连接。
+
+**多窗口**：除 `list_windows` / `get_app_info` 外，所有工具都额外接受可选整数参数 `window_id`（来自 `list_windows`，等于应用的 `WindowKey`）。只连着一个窗口时可省略；多个窗口在线却不传会直接报错。段内示例里的「无参数」均指**除 `window_id` 外无参数**。
 
 ---
 
 ## 只读工具
+
+### `list_windows`
+
+无参数。列出当前已连入 MCP 的窗口，按 id 排序：
+
+```text
+windows connected (2):
+  id=0  window#0  gallery 0.1.0  connected
+  id=1  window#1  gallery 0.1.0  connected
+pass `window_id` to target a tool (optional only when exactly one window is connected)
+```
+
+`id` 就是调用其它工具时传的 `window_id`；`window#N` 是显示标签；状态为 `connected` / `reconnecting`（后者表示该窗口连接断了，等应用重连）。没有任何窗口连入时返回 `no window connected yet (...)`。多窗口工作流：先 `list_windows`，再带着 `window_id` 调 `get_layout` / `click` 等，每个窗口单独读回验证。
+
+### `get_app_info`
+
+无参数。返回当前默认窗口（只连一个时就是它）的 `hello` 身份文本；没连入时返回 `no app connected yet (...)`。要区分多个窗口看 `list_windows`。
 
 ### `get_layout`
 
@@ -236,9 +255,11 @@ gpu_shared_bytes=<字节 | unavailable (原因)>
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `path` | string | 否 | `.bmp` 输出位置；省略则写系统临时目录 |
+| `path` | string | 否 | 输出位置；省略则写系统临时目录下的 `.png`。传 `.bmp` 可保留原始 24bpp BMP |
+| `inline` | boolean | 否 | 默认 `false`；为 `true` 时除文本路径外，再返回一段 base64 PNG 的 image content（方便直接看图，但会占上下文） |
 
-- 渲染一帧并读回像素，输出 **24bpp BMP**。仅 D3D11 / D3D12 支持；其他后端返回错误。
+- 渲染一帧并读回像素，**默认无损导出 PNG**。D3D11 / D3D12 / Vulkan 支持（Vulkan 走交换链读回）。
+- 需要逐像素核对脏区/残影时传 `.bmp` 路径：桥返回的原始载荷就是 24bpp BMP，不经转换。
 - 强制渲染，不依赖「界面正好在动」。
 - 回执给**绝对路径**（客户端不知道 CLI 进程的 cwd，相对路径等于没说）。
 - 完成后只报告路径、格式与观察结果；不要把整张图编码或转储进对话。

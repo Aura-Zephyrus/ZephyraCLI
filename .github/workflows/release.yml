@@ -79,6 +79,8 @@ jobs:
           mkdir -p "$STAGE"
           cp "target/${TARGET}/release/zephyra${EXE}" "$STAGE/"
           cp "target/${TARGET}/release/cargo-zephyra${EXE}" "$STAGE/"
+          # agent skill 随包分发：安装脚本把它拷进 OpenCode 的 skills 目录。
+          cp -R skills "$STAGE/"
 
           tar -czf "dist/${NAME}.tar.gz" -C dist "$NAME"
           (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")

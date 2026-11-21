@@ -6,4 +6,5 @@ members = [
     "zephyra-cli",
     "zstylec",
     "zypuic",
+    "zanim",
 ]

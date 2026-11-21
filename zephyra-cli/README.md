@@ -31,7 +31,18 @@ cargo zephyra dev
 | `build` | 转交 `cargo build`（默认 release，`--debug` 切 debug），并将窗口配置嵌入应用 |
 | `info` | 版本与工具链状态（含路径） |
 | `props [过滤词]` | 列受支持的属性 |
+| `ai` | 输出机器可读的命令清单（`zephyra ai [command]`），由命令表生成 |
+| `init` | 给已有工程补项目级 MCP 配置、skill 与 `.gitignore` |
 | `mcp` | MCP server：AI 直连运行中的界面（见下） |
+
+### 给 AI 用的接口
+
+- 任意命令加全局 `--json`：stdout 只有一行 JSON 信封
+  `{"ok":bool,"exitCode":n,"stdout":[...],"stderr":[...]}`，成功与失败都好解析。
+  退出码含义：`0` 成功 / `1` 操作失败 / `2` 用法错 / `3` 环境缺失。
+- `zephyra ai`：输出全量命令清单（命令名、用途、参数、选项、退出码）的 JSON；
+  `zephyra ai build` 只看单命令。清单从 `COMMANDS` 表生成，不会和帮助文本漂移。
+  agent 用 shell 跑 CLI 时，先读一次清单即可知道全部能力。
 
 ### `new` — 新建项目
 
@@ -40,12 +51,23 @@ zephyra new myapp
 zephyra new myapp --path E:\work
 ```
 
-会生成可交互的窗口示例（hover / press / click 状态）、项目 `README.md`、
-`.zstyle` 样式表、`zephyra.toml` 和 `ZephyraUI.json` 窗口配置。`zephyra run`、
-`dev` 与 `build` 会把该配置嵌入应用构建；`dev` 也会监视它的变化并重启窗口。
-默认选择 D3D12；Windows 下可用
-`cargo run --no-default-features --features d3d11` 选择 D3D11。
-脚手架 Cargo manifest 中的 ZephyraUI 依赖指向当前源码 checkout，迁移工程时需修改依赖路径。
+模板从 `zephyra-cli/templates/app/` 生成（不再是源码里的 `format!` 字符串），包含：
+可交互示例 View、`.zstyle`、`zephyra.toml`、`ZephyraUI.json`、`.gitignore`、项目级
+`.opencode/opencode.jsonc` 与 `zephyra-mcp` skill。
+
+- 默认后端按平台选：Windows → D3D12，其它 → Vulkan。切换用
+  `cargo run --no-default-features --features d3d11|vulkan`。
+- `--no-agent` 跳过 MCP/skill；`--git` 顺手 `git init`；`--check` 生成后跑一次 `cargo check`。
+- 依赖指向兄弟目录 `ZephyraUI` 的绝对路径，生成前会校验它存在；迁移工程时需改路径。
+
+### `init` — 给已有工程补初始化
+
+```text
+zephyra init [dir]
+```
+
+写入项目级 MCP 配置 + skill + `.gitignore`（已有配置不覆盖）；`--no-agent` 跳过 agent 部分，
+`--git` 在还不是仓库时执行 `git init`。
 
 ### `mcp` — AI 集成
 
@@ -79,7 +101,12 @@ AI 客户端 ──stdio·JSON-RPC── zephyra mcp ←──TCP·行协议─�
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "servers": {
-      "zephyra": { "type": "local", "command": ["zephyra", "mcp"] }
+      "zephyra": {
+        "type": "local",
+        "command": ["zephyra", "mcp"],
+        "environment": { "ZEPHYRA_DEBUG_PORT": "7878" },
+        "codemode": false
+      }
     }
   }
 }
@@ -91,6 +118,8 @@ AI 客户端 ──stdio·JSON-RPC── zephyra mcp ←──TCP·行协议─�
 [mcp_servers.zephyra]
 command = "zephyra"
 args = ["mcp"]
+[mcp_servers.zephyra.environment]
+ZEPHYRA_DEBUG_PORT = "7878"
 ```
 
 - **Claude Desktop** —— `claude_desktop_config.json`：
@@ -98,23 +127,33 @@ args = ["mcp"]
 ```json
 {
   "mcpServers": {
-    "zephyra": { "command": "zephyra", "args": ["mcp"] }
+    "zephyra": { "command": "zephyra", "args": ["mcp"], "env": { "ZEPHYRA_DEBUG_PORT": "7878" } }
   }
 }
 ```
 
 - **Claude Code** —— `claude mcp add zephyra -- zephyra mcp`
 
-`--port` 是 MCP 的**监听端口**（默认 7878，也读环境变量 `ZEPHYRA_MCP_PORT`）。
-CLI 把同一个环境变量的值交给应用，所以一处设置两端自动对齐；若改了端口，
-确保启动应用的 dev 进程也能看到同一个 `ZEPHYRA_MCP_PORT`。
+**CDP 式拓扑**（与 Chrome DevTools MCP 相同）：应用持有监听端口，MCP 进程**连出去**。
+应用监听 `ZEPHYRA_DEBUG_PORT` 基址，多窗口时每窗口监听 `基址 + WindowKey`（7878、7879……）；
+MCP 连上后发 `identify` 拿窗口 id。所以**多个 agent 窗口共用同一份 MCP 配置**也不会抢端口。
+
+`zephyra mcp [--port 7878] [--host 127.0.0.1]` 里的 `--port` 现在是**应用桥的基址**，
+默认读 `ZEPHYRA_DEBUG_PORT`，再退回旧 `ZEPHYRA_MCP_PORT`，最后 7878。
+`zephyra dev` / `run` 会把同一个基址写进应用子进程的 `ZEPHYRA_DEBUG_PORT`。
 `initialize` 返回的 `instructions` 会被 OpenCode / Claude 注入系统提示，
-告诉模型「先读布局、再操作、再读回」的工作流。
+告诉模型「先读布局、再操作、再读回」以及多窗口先用 `list_windows` 的工作流。
+
+**两种传输**：默认是 stdio（每个 agent 目录一个进程）；加 `--http` 则启动 Streamable HTTP，
+一个长驻服务给所有 agent 共用，配置里改用 `{"type":"remote","url":"http://127.0.0.1:8931/mcp"}`。
+`--http-port` 改监听端口（默认 8931），`--port` 仍是应用桥基址。HTTP 模式同样声明
+`2026-07-28` 协议并支持 `server/discover` 探测。
 
 **工具表**：
 
 | 工具 | 干什么 |
 |---|---|
+| `list_windows` | 列出当前连入的窗口 id（即应用的 `WindowKey`）、标签、身份与连接状态；多窗口时先调它 |
 | `get_layout` | 给模型的纯文本布局上下文：物理像素视口、最近帧统计、节点路径/tag/key/绝对边界/classes；要读完整节点属性用 `get_props` |
 | `get_tree` | 布局树 dump。每行 `path tag key x,y w*h [styles]`；路径列（子下标链）是 `get_props` 的钥匙；坐标是**绝对**像素，与 `hover`/`click` 同一坐标系——从树里抄个坐标就能点 |
 | `get_props {path}` | 单节点属性表（tag/key/矩形/样式分类/全部属性） |
@@ -128,7 +167,11 @@ CLI 把同一个环境变量的值交给应用，所以一处设置两端自动�
 | `analyze_performance {duration_seconds,include_rows?}` | 默认关闭，按次选择性采集逐帧 CPU 生成性能；必须声明 1–300 秒，最多 3000 帧。**默认只回汇总**（min/avg/p50/p95/max）——逐帧行最多 3000 行 ≈ 120KB，不该灌进模型上下文；要逐帧明细传 `include_rows=true` |
 | `press_key {key}` | 注入逻辑键按下与抬起；`View::on_input` 收到两个键边沿 |
 | `scroll {x,y,delta_x,delta_y}` | 指定物理像素位置注入滚轮；正 `delta_y` 向上，事件交给 `View::on_input` |
-| `screenshot {path?}` | 渲一帧读回 BMP 存盘（D3D11 / D3D12 支持；文本布局请用 `get_layout`）。回执里的路径是**绝对**路径——客户端不知道本进程的 cwd，相对路径等于没说 |
+| `screenshot {path?}` | 渲一帧读回像素并**默认存为 PNG**（D3D11 / D3D12 支持；文本布局请用 `get_layout`）。显式传 `.bmp` 路径可保留原始 24bpp BMP。回执里的路径是**绝对**路径——客户端不知道本进程的 cwd，相对路径等于没说 |
+
+除 `list_windows` / `get_app_info` 外，**所有工具都接受可选整数 `window_id`**（来自
+`list_windows`）。`WindowSet` 应用里每个窗口各连一条桥、各报自己的 id；只连一个窗口时可省略，
+多个窗口在线却不指定会报错（不会猜一个）。坐标系也是每窗口独立的，换窗口要重新取树。
 
 每个工具带 MCP `annotations`（`readOnlyHint` / `destructiveHint`）：读类工具
 （`get_*` / `ping`）为只读，输入与采集类（`hover` / `click` / `press_key` /

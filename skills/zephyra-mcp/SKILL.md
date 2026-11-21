@@ -1,182 +1,108 @@
 ---
 name: zephyra-mcp
-description: 'Operate and inspect a running ZephyraUI application through the ZephyraUI MCP server. This skill should be used when reading UI layout or node properties of a running ZephyraUI app, driving it with hover / click / key / scroll / drag input, capturing screenshots, collecting frame performance profiles or resource telemetry, or troubleshooting the ZephyraUI MCP connection.'
-argument-hint: 'Describe the running ZephyraUI app and the interaction or diagnostics you need'
+description: 'Operate and inspect a running ZephyraUI application through the ZephyraUI MCP server. Use when reading UI layout or node properties of a running ZephyraUI app, driving it with hover / click / key / scroll / drag, capturing screenshots, collecting frame performance profiles or resource telemetry, or troubleshooting the MCP connection.'
+argument-hint: 'Describe the running app and the interaction or diagnostics you need'
 ---
 
 # ZephyraUI MCP 操作
 
-通过 ZephyraUI MCP server 检查并操作**用户授权的、本机运行中的 ZephyraUI 窗口**。
+用 MCP 工具检查/操控**本机运行中的** ZephyraUI 窗口。默认用文本布局理解界面，截图只在需要像素证据时用；性能采集按需限时。结论必须有读回状态佐证。
 
-默认用文本布局理解界面，只有在需要像素证据或文本无法判断时才截图。性能采集按需、限时开启。所有结论必须有读回状态佐证。
+## 选对入口
 
-## 何时用 / 何时不用
+- **运行中的应用**（读布局/注入输入/截图/性能）→ MCP 工具。
+- **工程级事情**（建项目、校验、排版、构建、跑 dev、查属性/版本）→ shell 跑 `zephyra ...`。MCP 里**没有** `build` / `check` / `fmt` / `dev` 工具，别找。
+- 不确定参数 → `zephyra ai <command>` 或 `zephyra --help`。
+- 读源码语义 → `docs/developer/`、`docs/dev-log/`，不是 MCP 的事。
 
-| 用 | 不用 |
-|---|---|
-| 读布局树、节点属性、视口、最近一帧统计 | 读源码语义 —— 那是 `docs/developer/` 与 `docs/dev-log/` 的事 |
-| hover / click / 按键 / 滚轮 / 按住拖动 | 在应用**没启动**时操作 —— 没有进程就没有桥 |
-| 截图取像素证据 | 把截图当布局的替代品（截图无结构、无路径、无属性） |
-| 帧 CPU 生成耗时、进程 CPU/内存/GPU 遥测 | 断言 GPU 执行耗时（本工具不是 GPU timestamp profiler） |
+CLI 输出：加全局 `--json` 得 `{"ok","exitCode","stdout":[...],"stderr":[...]}`；退出码 `0` 成功 / `1` 操作失败 / `2` 用法错 / `3` 环境缺失，`stderr` 是错误。
 
-## 链路
+## 连接与多窗口
 
-```text
-MCP 客户端 ──stdio·JSON-RPC── zephyra mcp（CLI）──TCP·行协议── 运行中的 ZephyraUI 应用
-```
+应用监听 `ZEPHYRA_DEBUG_PORT` 基址（默认 7878），每个窗口占 `基址 + window id`；MCP 进程连出去，多个 agent 不抢端口。连接/外设由安装器配置，通常无需手动设置。
 
-三层各司其职：应用侧桥生成文本与执行注入；CLI 只做翻译并持有唯一桥连接；客户端只见 MCP 工具。
+- 桥**默认关闭**：设了 `ZEPHYRA_DEBUG_PORT=<端口>` 才监听，空字符串取默认 7878。端口被占时桥绑定失败但**应用照常运行**（无桥），stderr 会打印失败。
+- 启动成功标志：stderr 出现 `[zephyra] 调试桥已开启 127.0.0.1:<端口>`，多窗口时每窗口一行。
+- `zephyra dev` / `run` 起的子进程继承该环境变量；先设变量再 `dev` 同样能开桥。
+- 应用仓库通常在 `E:\zephyra-gallery`（默认 `d3d12`）；切 D3D11 用 `--no-default-features --features d3d11`，切 Vulkan 加 `--features linux-vk`。互斥后端不要同时启用。
+- `zephyra mcp [--port <基址>] [--host <addr>]`：`--port` 默认读 `ZEPHYRA_DEBUG_PORT`，再退回 `ZEPHYRA_MCP_PORT`，最后 7878；发现线程扫 `基址..基址+16`。stdout 只有 JSON-RPC，诊断全在 stderr。
+- 客户端配置：OpenCode v2 用 `mcp.servers.zephyra`（`type: local`、`command: ["zephyra","mcp"]`、`environment.ZEPHYRA_DEBUG_PORT="7878"`、`codemode:false`）；Codex 用 `[mcp_servers.zephyra]` + `args=["mcp"]`；Claude Desktop 用 `mcpServers.zephyra`。多 agent 共用一个长驻服务时改用 Streamable HTTP：`zephyra mcp --http --http-port 8931`，配置 `{"type":"remote","url":"http://127.0.0.1:8931/mcp"}`。
+- 握手 `initialize` / `tools/list` 不需要应用在线；工具调用才需要应用连上。协议版本声明到 2026-07-28（含 `server/discover`），向下兼容 2025-11-25 等。
 
-### 1. 应用侧：开启调试桥
+- 先 `list_windows` 拿 id，再给工具传 `window_id`。只连一个窗口时可省略；多个窗口在线时**必填**，不传报错。
+- `list_windows` 显示 `reconnecting` 的窗口已断连，等它重连，别再对该 id 发命令。
+- `ping` 走桥，用来区分「MCP server 就绪」与「应用在线」。
 
-库层调试桥**默认关闭**，只有设置了 `ZEPHYRA_DEBUG_PORT` 才监听；未设置时零监听，不存在隐式端口。
+## 工作流：读 → 操作 → 读
 
-```bash
-# Windows PowerShell（工作目录 E:\zephyra-gallery）
-$env:ZEPHYRA_DEBUG_PORT = "7878"
-cargo run --bin gallery
-
-# bash / Linux（工作目录为 gallery 仓）
-ZEPHYRA_DEBUG_PORT=7878 cargo run --bin gallery
-```
-
-- 取值是端口号；**空字符串取默认端口 7878**（`zephyra-fx::bridge` 的 `PORT_ENV` / `DEFAULT_PORT`）。
-- 端口被占时桥绑定失败，**应用照常运行**（stderr 打印绑定失败，无桥继续运行）—— 端口冲突不会让应用起不来。
-- 启动成功的标志是 stderr 出现 `[zephyra] 调试桥已开启 127.0.0.1:7878`。
-- gallery 已迁至独立仓 `E:\zephyra-gallery`（单向依赖主仓），以下命令在该仓运行。
-- 后端切换走工程现有的 Cargo feature，不要同时启用互斥后端：`zephyra-gallery` 默认 `d3d12`，`--no-default-features --features d3d11` 切 D3D11，`--features linux-vk` 切 Vulkan。
-- `zephyra dev` / `zephyra run` 会 `Command::new(cargo)` 起子进程并**继承环境变量**，所以先 `export ZEPHYRA_DEBUG_PORT` 再 `zephyra dev` 同样开桥。
-
-### 2. 两侧拓扑：agent ↔ MCP（stdio）← 应用（连入）
-
-**方向**：MCP 与 agent 绑定、与应用分离。agent 只经 stdio 与 MCP 说话；
-MCP 监听本地端口，**应用启动后主动连进来**。`zephyra dev` / `run` 启动应用时
-把监听端口经 `ZEPHYRA_MCP_PORT` 交给子进程，应用据此连回 MCP —— agent 侧
-不需要知道应用的调试端口。
-
-客户端配置：
-
-- **OpenCode v2**（`opencode.jsonc`，v2 用 `mcp.servers`）：
-  ```jsonc
-  { "mcp": { "servers": {
-    "zephyra": { "type": "local", "command": ["zephyra", "mcp"] }
-  } } }
-  ```
-- **Codex**（`~/.codex/config.toml`）：
-  ```toml
-  [mcp_servers.zephyra]
-  command = "zephyra"
-  args = ["mcp"]
-  ```
-- **Claude Desktop**：`{"mcpServers":{"zephyra":{"command":"zephyra","args":["mcp"]}}}`
-- **Claude Code**：`claude mcp add zephyra -- zephyra mcp`
-
-- CLI 二进制名是 `zephyra`（另有 `cargo-zephyra`）。不在 `PATH` 时把 command 换成完整路径，例如仓库内的 `target/release/zephyra.exe`。
-- `zephyra mcp [--port 7878] [--host 127.0.0.1]`。`--port` 是 **MCP 自己的监听端口**，默认 7878，也读环境变量 `ZEPHYRA_MCP_PORT`；dev 把同一个变量的值交给应用，所以一处设置两端对齐。`--host` 默认 `127.0.0.1`。
-- CLI 的 stdout **只**输出 JSON-RPC 协议消息，诊断一律走 stderr；`mcp` 启动后 stderr 首行是 `[zephyra-mcp] ready (listening for app on 127.0.0.1:7878); stdout is protocol-only`。应用连入时打 `[zephyra-mcp] app connected`。
-- 握手（`initialize` / `tools/list`）**不需要**应用在线；但工具调用需要应用已连入，否则回明确错误「应用尚未连入 MCP……用 zephyra dev 启动应用」。
-- 协议版本协商 `2025-11-25` / `2025-06-18` / `2025-03-26` / `2024-11-05`（客户端要哪个回哪个，不认识回最新的）。`initialize` 的 `instructions` 告诉模型读-改-读工作流。
-
-## 标准工作流
-
-**读 → 操作 → 读**。所有工具都是这三步里的一步，工具之间没有隐式状态。
-
-### 读
-
-1. `get_layout` 一次拿到三样东西：视口（物理像素）、最近一帧统计、布局树。
-2. 从布局树里挑目标：路径（`get_props` 的钥匙）、绝对矩形、tag、key、样式分类名。
-3. 目标矩形无效（零宽高）、不可见、被遮挡时不要盲点——先换目标或换页面。
-4. 需要完整属性再 `get_props`，路径必须来自最新一次 `get_tree` / `get_layout` 的返回值。
-
-### 操作
-
-对单个目标做最小必要动作，**一次一个**，等工具返回再决定下一步。
-
-- `hover` / `click`：坐标取自最新布局的绝对矩形内部（远离边缘）。
-- `press_key`：单个逻辑键名，见下方「能力边界」。
-- `scroll`：在目标位置注入滚轮增量。
-- `pointer_drag`：一次**按下—按住—移动—抬起**的连续手势，不是多个 click。
-
-### 验证
-
-操作后重新读状态：`get_layout`（看树变化）、`get_props`（看该节点属性变化）、`get_stats`（看 hovered / dirty）。
-
-- 状态可能异步更新时，隔一拍再读一次；不要靠快速重复点击碰运气。
-- 桥响应成功 **≠** 应用行为正确。`click` 回 `clicked` 只说明事件注入了，不说明控件状态变了。
+1. `get_layout` 一次拿视口（物理像素）+ 帧统计 + 布局树；从树里挑目标（路径 / 绝对矩形 / key）。
+2. 最小必要动作，**一次一个**：`click` / `hover` / `press_key` / `scroll` / `pointer_drag`（一整段手势，不是多个 click）。目标矩形零宽高或不可见时不要点。
+3. 操作后重新 `get_layout` / `get_props` / `get_stats` 验证。状态异步更新时隔一拍再读，不要靠快速重复点击碰运气。桥回 `clicked` 只说明事件注入了，**不等于**应用行为正确；`wait_frames` 可按渲染帧等待。
 
 ## 工具速查
 
 | 工具 | 参数 | 用途 |
 |---|---|---|
-| `get_layout` | 无 | 文本布局全量：视口 + 帧统计 + 树 |
-| `get_tree` | 无 | 只要布局树 |
-| `get_props` | `path` | 单节点全部属性与样式值 |
-| `get_stats` | 无 | 最近一帧统计 |
-| `get_viewport` | 无 | 视口物理像素尺寸 |
-| `get_resources` | 无 | 进程 CPU / 内存 / GPU 遥测 |
-| `ping` | 无 | 探**应用**是否在线（区别于 MCP 协议层 ping 探 server 进程） |
-| `hover` | `x`, `y` | 移动指针 |
-| `click` | `x`, `y` | 完整点击（move → down → up） |
-| `press_key` | `key` | 单个逻辑键按下/抬起 |
-| `scroll` | `x`, `y`, `delta_x`, `delta_y` | 定位滚轮注入 |
-| `pointer_drag` | `mode` + 参数 | 按住拖动 |
+| `list_windows` | 无 | 列窗口 id / 身份 / 状态（多窗口先调） |
+| `get_layout` / `get_tree` | 无 | 布局上下文 / 只要树 |
+| `get_props` | `path` | 单节点全部属性 |
+| `get_stats` / `get_viewport` / `get_resources` | 无 | 帧统计 / 视口 / 进程与 GPU 遥测 |
+| `ping` | 无 | 应用是否在线 |
+| `hover` / `click` | `x`, `y` | 移动 / 完整点击 |
+| `press_key` | `key` | 逻辑键按下抬起 |
+| `scroll` | `x`, `y`, `delta_x`, `delta_y` | 滚轮注入 |
+| `pointer_drag` | `mode` + 参数 | 按住拖动（可带 progressToken） |
 | `analyze_performance` | `duration_seconds`，可选 `include_rows` | 有界逐帧 CPU 报告 |
-| `screenshot` | 可选 `path` | 24bpp BMP（D3D11 / D3D12） |
+| `screenshot` | 可选 `path`, `inline` | 默认 PNG；`inline=true` 回 base64 图片（默认只给路径，省上下文） |
+| `get_app_info` | 可选 `window_id` | 应用身份 |
+| `click_by_key` / `hover_by_key` | `key` | 按元素 key 点击 / 悬停（免抄坐标） |
+| `click_by_path` / `hover_by_path` | `path` | 按树路径点击 / 悬停 |
+| `find_by_text` | `text` | 按可见文字找元素 |
+| `type_text` | `text` | 输入一段文字（语义动作，非逐键） |
+| `wait_frames` | `frames` | 等应用真渲染 N 帧再返回 |
+| `hit_test` | `x`, `y` | 反查某像素上的元素 |
+| `touch` | `phase`, `pointer_id`, `x`, `y` | 多点触控注入 |
+| `resize_window` | `width`, `height` | 改客户区尺寸（物理像素） |
 
-完整参数、返回样例见 `references/tools.md`；各工具返回文本的确切格式见 `references/output-formats.md`。
+除 `list_windows` 外都接受可选 `window_id`。工具返回优先读 `structuredContent`，`content` 文本兜底。完整参数与返回样例见 `references/tools.md`、`references/output-formats.md`。
 
-## 坐标系与路径
+## 坐标与路径（易错）
 
-- `get_layout` / `get_tree` / `hover` / `click` / `scroll` / `pointer_drag` 共用**窗口物理像素坐标系**，节点矩形是**绝对坐标**。从树里抄一个坐标就能直接点。
-- **不要**累加父级偏移，**不要**把截图上的缩放坐标直接传进去。
-- `get_props` 的 `rect` 行同样以 `(absolute)` 标注，是绝对坐标——MCP 工具自身描述里写的 "relative to parent" 与实现不符，**以返回文本里的 `(absolute)` 为准**（`zephyra-fx::bridge::props_dump_of` 打印的就是绝对矩形）。
-- 树路径首段 `0` 是**根标记**，其余段是逐层子下标（`0.1.2` = 根的第 2 个子节点的第 3 个子节点）。`get_props` 按根标记解析路径，路径错了会返回「路径 … 不存在」。
-- 样式分类名只是名字，**不是**状态值：`hovered` / `pressed` / `focused` 这类状态要看 `get_props` 里的属性与 `get_stats` 的 `hovered` 字段。
+- 所有坐标是**窗口物理像素、绝对坐标**，从树里抄一个点就能点；不要累加父级偏移、不要把截图缩放坐标直接用。`hit_test` 可用来反查「某个像素上是什么」。
+- **每窗口独立一套坐标**：窗口 A 的坐标不能拿去点窗口 B。
+- `get_props` 的 `rect` 行以 `(absolute)` 标注，为准（工具描述里的 "relative to parent" 是旧的）。
+- 树路径首段 `0` 是根标记，其余是逐层子下标（`0.1.2`）。样式分类名只是名字，不是状态；状态看 `get_props` 属性与 `get_stats.hovered`。
 
-## 能力边界（不要越界推断）
+## 能力边界（越界会得出错误结论）
 
-这几条是实现里的硬事实，越界会得到看似成功实则错误的结果。
+- D3D11/D3D12/Vulkan 都可用；Vulkan 的 `get_resources` 仅 Windows 提供，Linux 下该工具报错，不是断连。
+- `press_key` 白名单：`Backspace Delete Enter Escape Space Tab ArrowLeft/Right/Up/Down Home End PageUp/PageDown`；单字符会「边沿+字符」，白名单键只产生边沿、**不产生字符事件**，且**无修饰键**（Ctrl/Alt/Shift 不支持）。`press_key("Space")` 不会往文本框插入空格，也不接受裸空格字符。
+- 应用是否响应输入取决于应用是否消费 `View::on_input`；如 gallery 不消费文本事件，MCP 输入文字不会生效。
+- `scroll` 增量单位跟随后端；性能报告是 **CPU 生成耗时**，不是 GPU 执行时间；资源是单次采样，`warming_up` 不是真实读数。
 
-1. **只有 D3D11 与 D3D12 宿主实现了调试桥。** `zephyra-vulkan` 没有实现 `BridgeHost`，所以 Linux / Vulkan 应用下 **MCP 整体不可用**——不是「截图不支持」，是所有工具都连不上。
-2. **`press_key` 的键名有白名单。** `Key::from_name` 认得的只有：`Backspace`、`Delete`、`Enter`（`NumpadEnter` 同）、`Escape`、`Space`、`Tab`、`ArrowLeft`/`ArrowRight`/`ArrowUp`/`ArrowDown`、`Home`、`End`、`PageUp`/`PageDown`。
-3. **白名单键只产生键边沿，不产生字符事件。** 单个非控制字符（如 `a`）会产生「边沿 + 字符」；其余名字（如 `F5`）只产生边沿，身份保留在 `KeyInput::name` 里。
-4. **`press_key("Space")` 不等于物理空格键。** 物理空格在系统层会同时产生 `Char(' ')`，而注入的 `"Space"` 命中键名白名单、**不产生字符事件**，文本框里不会插入空格。`press_key` 也不接受裸空格字符（参数不允许空白字符）。
-5. **`press_key` 没有修饰键位。** 注入的按键一律不带 Ctrl / Alt / Shift，组合快捷键无法模拟。
-6. **应用是否响应输入取决于应用。** 宿主把事件交给 `View::on_input` 的输入状态；应用不消费就没有效果。当前 gallery 的 `on_input` 不消费文本事件，因此**通过 MCP 向 gallery 的文本框输入文字不会生效**。
-7. **`scroll` 的增量单位跟随后端**，不要假定是「行数」。
-8. **性能报告是 CPU 生成耗时**，不是 GPU 执行时间；单帧最大值不能代表整体表现。
-9. **资源读数是单次采样**，不是基准；不同时间的两次读数不能直接相减当趋势。
+## 排障
 
-## 排障入口
-
-| 现象 | 先看 |
+| 现象 | 处理 |
 |---|---|
-| 工具调用报连不上应用 | 应用是否带 `ZEPHYRA_DEBUG_PORT` 启动；CLI `--port` 是否与应用端口一致（CLI 默认 7878 且不读环境变量） |
-| MCP 握手成功但工具全失败 | 用 `ping` 工具（走桥）区分「server 就绪」与「应用在线」 |
-| 应用重启后调用失败 | 传输失败会丢连接重连重试一次；等应用窗口出现后重试即可，会话不用重建 |
-| 点了没反应 | 重新 `get_layout` 取最新绝对坐标；确认目标矩形可见非零；点后用 `get_props` 核验状态是否真变 |
-| 截图不可用 / 空 / 写盘失败 | 只有 D3D11 / D3D12 支持像素读回；给可写的 `.bmp` 路径；失败时改用 `get_layout` 并保留原错误 |
-| 性能采集 0 帧 | 采集期间没有完成宿主帧（窗口静止且未触发重绘）；如实报告未完成，不要编造数据 |
+| 连不上应用 | 应用是否设了 `ZEPHYRA_DEBUG_PORT`；`--port` 基址是否一致；等应用起来重试 |
+| 握手成功但工具全失败 | `ping` 分辨 server 与应用状态 |
+| 点了没反应 | 重新 `get_layout` 取坐标、确认可见非零，再用 `get_props` 核验 |
+| 落到错误的窗口 | `list_windows` 核对 `window_id`，不要猜第一个 |
+| 截图空/失败 | 给可写 `.png`（或 `.bmp`）路径；失败改用 `get_layout`，保留原错误 |
+| 性能 0 帧 | 采集期间无宿主帧（静止窗口），如实报告未完成 |
 
-完整排查步骤与更多场景见 `references/troubleshooting.md`。
+完整步骤见 `references/troubleshooting.md`。
 
-## 汇报结果
+## 汇报
 
-简短说明：目标窗口、执行过的工具与动作、**读回验证到的状态**、数据口径与限制。
+说清：目标窗口、做过的动作、**读回验证的状态**、数据口径与限制。性能注明时长/帧数/单位；资源注明采样时间与不可用字段；超时/未验证的步骤明确标未完成。不要把「桥响应成功」说成「应用行为正确」。
 
-- 性能数据注明采样时长、帧数、单位、字段可用性。
-- 资源数据注明采样对象、时间点，以及哪些字段 unavailable / warming_up。
-- 未验证、超时、不支持的步骤明确标为未完成。
-- 不要把「桥响应成功」说成「应用行为正确」。
+## 参考（相对仓库根）
 
-## 仓库内参考
-
-以下路径均**相对仓库根**：
-
-- `E:\ZephyraCLI\zephyra-cli\README.md` —— CLI 命令表与 `mcp` 子命令说明
-- `zephyra/zephyra-fx/src/bridge.rs` —— 桥协议、行解析、树/属性 dump、采集器
-- `E:\ZephyraCLI\zephyra-cli\src\commands\mcp.rs` —— MCP 工具表、schema、并发模型、重连与取消
-- `docs/dev-log/2026-10-25-mcp-debug-bridge.md` —— 调试桥的引入与协议分层
-- `docs/dev-log/2026-10-26-mcp-input-layout-d3d12-capture.md` —— 输入注入、文本布局、D3D12 读回截图
-- `docs/dev-log/2026-10-26-mcp-clicks-resources.md` —— 拖动、逐帧性能、资源遥测
-- `docs/dev-log/2026-10-26-mcp-reconnect-timeout.md` —— 重连、读超时、线程模型、取消
+- `zephyra-cli/README.md`：CLI 命令表
+- `zephyra-cli/src/commands/mcp.rs`：MCP 工具表与并发模型
+- `zephyra/zephyra-fx/src/bridge.rs`：桥协议与 dump
+- `docs/dev-log/2026-10-25-mcp-debug-bridge.md`：协议分层
+- `docs/dev-log/2026-10-26-mcp-input-layout-d3d12-capture.md`：输入注入与截图读回
+- `docs/dev-log/2026-10-26-mcp-clicks-resources.md`：拖动、逐帧性能、资源遥测
+- `docs/dev-log/2026-10-26-mcp-reconnect-timeout.md`：重连、超时、取消

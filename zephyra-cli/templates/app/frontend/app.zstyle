@@ -1,0 +1,10 @@
+/* ZephyraUI stylesheet.
+ *
+ * 检查：`zephyra check frontend/app.zstyle`
+ * 列全部受支持的属性：`zephyra props`
+ */
+
+text {
+    text-color: #202020;
+    text-size: 24;
+}

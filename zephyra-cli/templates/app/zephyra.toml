@@ -1,0 +1,9 @@
+[app]
+name = "{{NAME}}"
+# 窗口初始尺寸（物理像素）。改这里就能看到 live resize 的效果。
+width = 1000
+height = 640
+
+[styles]
+# 相对工程根。改完跑 `zephyra check frontend/app.zstyle`。
+files = ["frontend/app.zstyle"]
