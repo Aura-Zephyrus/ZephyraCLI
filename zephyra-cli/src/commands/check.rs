@@ -136,7 +136,7 @@ fn emit_json(rs: &[zstylec::FileReport], w: &mut dyn Write) {
                 }
             ));
         }
-        w.line("  ]}}");
+        w.line("  ]}");
         if fi + 1 != rs.len() {
             w.line(",");
         }

@@ -2,3 +2,7 @@
 **/target/
 *.bk
 *.tmp
+
+# cargo-mutants 的运行输出（变异体日志，非源码）
+mutants.out/
+mutants.out.old/

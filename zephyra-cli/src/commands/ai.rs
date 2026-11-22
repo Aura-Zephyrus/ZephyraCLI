@@ -74,6 +74,7 @@ pub fn run(args: &Args, w: &mut dyn Write) -> Result<ExitCode, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::ParseOutcome;
 
     #[test]
     fn manifest_is_generated_from_the_command_table() {
@@ -87,5 +88,52 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("--json")));
+    }
+
+    #[test]
+    fn single_command_detail_emits_that_command_only() {
+        let ParseOutcome::Parsed(args) = crate::args::parse(["ai", "check"].map(String::from))
+        else {
+            panic!("expected Parsed");
+        };
+        let mut out = Vec::new();
+        let code = run(
+            &args,
+            &mut crate::commands::Io {
+                out: &mut out,
+                err: &mut Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(code, ExitCode::Success);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["name"], "check",
+            "single-command manifest is the command object"
+        );
+        assert!(
+            v["options"].is_array(),
+            "command detail carries its options"
+        );
+    }
+
+    #[test]
+    fn unknown_command_detail_is_a_usage_error() {
+        let ParseOutcome::Parsed(args) =
+            crate::args::parse(["ai", "no-such-command"].map(String::from))
+        else {
+            panic!("expected Parsed");
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = run(
+            &args,
+            &mut crate::commands::Io {
+                out: &mut out,
+                err: &mut err,
+            },
+        );
+        assert!(result.is_err(), "unknown command must be a usage error");
+        assert!(result.unwrap_err().message.contains("unknown command"));
     }
 }

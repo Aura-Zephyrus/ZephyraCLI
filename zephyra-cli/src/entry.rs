@@ -240,4 +240,104 @@ mod tests {
         assert!(!capture.out.is_empty());
         assert!(capture.err.is_empty(), "{:?}", capture.err);
     }
+
+    #[test]
+    fn help_for_a_known_command_renders_scoped_help() {
+        let mut capture = Capture::default();
+        let code = dispatch(
+            "zephyra",
+            vec!["check".into(), "--help".into()],
+            &mut capture,
+        );
+        assert_eq!(code, ExitCode::Success);
+        assert!(capture.out.iter().any(|l| l.contains("check")));
+        assert!(capture.err.is_empty(), "{:?}", capture.err);
+    }
+
+    #[test]
+    fn help_for_an_unknown_command_is_a_usage_error() {
+        let mut capture = Capture::default();
+        let code = dispatch(
+            "zephyra",
+            vec!["totally-fake".into(), "--help".into()],
+            &mut capture,
+        );
+        assert_eq!(code, ExitCode::Usage);
+        assert!(capture.err.iter().any(|l| l.contains("unknown command")));
+    }
+
+    #[test]
+    fn no_command_prints_help_and_returns_usage() {
+        let mut capture = Capture::default();
+        let code = dispatch("zephyra", vec![], &mut capture);
+        assert_eq!(code, ExitCode::Usage);
+        assert!(
+            !capture.err.is_empty(),
+            "bare invocation must print help to stderr"
+        );
+    }
+
+    #[test]
+    fn unknown_command_suggests_the_nearest_match() {
+        let mut capture = Capture::default();
+        // "bui" 是 "build" 的真前缀，应给出 did-you-mean。
+        let code = dispatch("zephyra", vec!["bui".into()], &mut capture);
+        assert_eq!(code, ExitCode::Usage);
+        assert!(
+            capture.err.iter().any(|l| l.contains("did you mean")),
+            "must suggest a nearby command: {:?}",
+            capture.err
+        );
+    }
+
+    #[test]
+    fn unknown_flag_for_a_command_is_rejected_not_ignored() {
+        let mut capture = Capture::default();
+        // --json 是全局的，但 --bogus 不属于 info。
+        let code = dispatch(
+            "zephyra",
+            vec!["info".into(), "--bogus-flag".into()],
+            &mut capture,
+        );
+        assert_eq!(code, ExitCode::Usage);
+        assert!(
+            capture.err.iter().any(|l| l.contains("unknown flag")),
+            "unknown flag must be reported: {:?}",
+            capture.err
+        );
+        assert!(
+            capture.err.iter().any(|l| l.contains("accepted:")),
+            "error must list accepted flags: {:?}",
+            capture.err
+        );
+    }
+
+    #[test]
+    fn unknown_option_for_a_command_is_rejected_not_ignored() {
+        let mut capture = Capture::default();
+        // --format 是 check 的取值选项；build 不认识它 → unknown option。
+        let code = dispatch(
+            "zephyra",
+            vec!["build".into(), "--format".into(), "x".into()],
+            &mut capture,
+        );
+        assert_eq!(code, ExitCode::Usage);
+        assert!(
+            capture.err.iter().any(|l| l.contains("unknown option")),
+            "unknown option must be reported: {:?}",
+            capture.err
+        );
+    }
+
+    #[test]
+    fn version_prints_the_binary_name_and_version() {
+        let mut capture = Capture::default();
+        let code = dispatch("zephyra", vec!["--version".into()], &mut capture);
+        assert_eq!(code, ExitCode::Success);
+        assert!(
+            capture.out.iter().any(|l| l.starts_with("zephyra ")),
+            "version line: {:?}",
+            capture.out
+        );
+    }
 }

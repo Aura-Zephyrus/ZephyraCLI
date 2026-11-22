@@ -370,3 +370,47 @@ impl Args {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_of_a_value_option_shows_its_value_placeholder() {
+        let spec = ArgSpec::value("path", "dir", "target dir");
+        assert_eq!(spec.display(), "--path <dir>");
+    }
+
+    #[test]
+    fn display_of_a_flag_has_no_value_placeholder() {
+        let spec = ArgSpec::flag("force", "overwrite");
+        assert_eq!(spec.display(), "--force");
+    }
+
+    #[test]
+    fn display_with_a_short_alias_puts_it_first() {
+        let spec = ArgSpec::flag("verbose", "more output").with_short('v');
+        assert_eq!(spec.display(), "-v, --verbose");
+    }
+
+    #[test]
+    fn value_option_with_an_empty_placeholder_omits_the_brackets() {
+        let spec = ArgSpec::value("name", "", "name");
+        assert_eq!(spec.display(), "--name");
+    }
+
+    #[test]
+    fn is_value_flag_uses_the_command_table() {
+        assert!(is_value_flag("path"), "new --path takes a value");
+        assert!(!is_value_flag("force"), "new --force is a flag");
+        assert!(!is_value_flag("no-such-flag-at-all"));
+    }
+
+    #[test]
+    fn short_spec_ignores_multi_character_clusters() {
+        // `-foo` 不能被当成短别名 `f` + "oo"。当前没有声明短别名，
+        // 两种情况都返回 None；这条锁住「多字符不解析成单字符别名」。
+        assert!(short_spec("foo").is_none());
+        assert!(short_spec("f").is_none());
+    }
+}
